@@ -1,0 +1,28 @@
+[package]
+name = "prefix_tracker"
+version = "0.1.0"
+edition = "2021"
+description = "High-performance bitmap-based existence tracking for key-value systems"
+license = "MIT"
+
+[dependencies]
+dashmap = "6"
+parking_lot = "0.12"
+fastrand = "2"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "benchmarks"
+harness = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
