@@ -13,7 +13,7 @@
 //! # Example
 //!
 //! ```
-//! use prefix_tracker::{PrefixGroupsTracker, TrackerConfig};
+//! use keyspace_tracker::{PrefixGroupsTracker, TrackerConfig};
 //!
 //! let groups = PrefixGroupsTracker::new();
 //!
@@ -82,7 +82,7 @@ type FastDashMap<K, V> = DashMap<K, V, AHasher>;
 /// ## Basic Usage
 ///
 /// ```rust
-/// use prefix_tracker::{PrefixGroupsTracker, TrackerConfig};
+/// use keyspace_tracker::{PrefixGroupsTracker, TrackerConfig};
 ///
 /// let groups = PrefixGroupsTracker::new();
 ///
@@ -98,7 +98,7 @@ type FastDashMap<K, V> = DashMap<K, V, AHasher>;
 /// ## Auto-Creation with Default Config
 ///
 /// ```rust
-/// use prefix_tracker::{PrefixGroupsTracker, TrackerConfig};
+/// use keyspace_tracker::{PrefixGroupsTracker, TrackerConfig};
 ///
 /// // Set a default config for auto-created trackers
 /// let groups = PrefixGroupsTracker::with_default_config(
@@ -113,7 +113,7 @@ type FastDashMap<K, V> = DashMap<K, V, AHasher>;
 /// ## Group Iteration
 ///
 /// ```rust
-/// use prefix_tracker::{PrefixGroupsTracker, TrackerConfig, ClaimPolicy};
+/// use keyspace_tracker::{PrefixGroupsTracker, TrackerConfig, ClaimPolicy};
 ///
 /// let groups = PrefixGroupsTracker::new();
 /// groups.register(TrackerConfig::simple("a:"));
@@ -144,7 +144,7 @@ impl PrefixGroupsTracker {
     /// # Examples
     ///
     /// ```rust
-    /// use prefix_tracker::PrefixGroupsTracker;
+    /// use keyspace_tracker::PrefixGroupsTracker;
     ///
     /// let groups = PrefixGroupsTracker::new();
     /// assert_eq!(groups.len(), 0);

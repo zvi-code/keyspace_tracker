@@ -1,7 +1,7 @@
-# prefix_tracker
+# keyspace_tracker
 
-[![Crates.io](https://img.shields.io/crates/v/prefix_tracker.svg)](https://crates.io/crates/prefix_tracker)
-[![Documentation](https://docs.rs/prefix_tracker/badge.svg)](https://docs.rs/prefix_tracker)
+[![Crates.io](https://img.shields.io/crates/v/keyspace_tracker.svg)](https://crates.io/crates/keyspace_tracker)
+[![Documentation](https://docs.rs/keyspace_tracker/badge.svg)](https://docs.rs/keyspace_tracker)
 [![License](https://img.shields.io/badge/License-BSD_3--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
 
 High-performance, lock-free bitmap-based existence tracking for key-value systems.
@@ -27,7 +27,7 @@ High-performance, lock-free bitmap-based existence tracking for key-value system
 ## Quick Start
 
 ```rust
-use prefix_tracker::{PrefixGroupsTracker, TrackerConfig, ClaimPolicy};
+use keyspace_tracker::{PrefixGroupsTracker, TrackerConfig, ClaimPolicy};
 
 // Create a registry for multiple prefixes
 let groups = PrefixGroupsTracker::new();
@@ -58,7 +58,7 @@ for (id, _) in users.iter().set_only().sequential() {
 Low-level lock-free bitmap with atomic operations:
 
 ```rust
-use prefix_tracker::AtomicBitmap;
+use keyspace_tracker::AtomicBitmap;
 
 let bitmap = AtomicBitmap::with_capacity(1_000_000);
 
@@ -82,7 +82,7 @@ let next_unset = bitmap.find_next_unset(0, 1_000_000);
 Single-prefix tracker with simple or hierarchical mode:
 
 ```rust
-use prefix_tracker::{PrefixTracker, TrackerConfig};
+use keyspace_tracker::{PrefixTracker, TrackerConfig};
 
 // Simple mode: flat ID space
 let simple = PrefixTracker::new(
@@ -110,7 +110,7 @@ assert!(!hier.exists_pair(1, 99));
 Registry of multiple trackers with group-level operations:
 
 ```rust
-use prefix_tracker::{PrefixGroupsTracker, TrackerConfig, ClaimPolicy};
+use keyspace_tracker::{PrefixGroupsTracker, TrackerConfig, ClaimPolicy};
 
 let groups = PrefixGroupsTracker::new();
 
@@ -260,7 +260,7 @@ for item in groups.iter().random().set_only().build().take(1000) {
 ### Claim Policies
 
 ```rust
-use prefix_tracker::ClaimPolicy;
+use keyspace_tracker::ClaimPolicy;
 
 // Round-robin across prefixes
 let mut w = groups.iter().write(ClaimPolicy::RoundRobin);

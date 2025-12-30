@@ -784,7 +784,7 @@ impl<'a> PartitionedIter<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::prefix_tracker::TrackerConfig;
+    use crate::keyspace_tracker::TrackerConfig;
 
     #[test]
     fn test_sequential_iter_simple() {

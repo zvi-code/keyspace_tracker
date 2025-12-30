@@ -153,7 +153,7 @@ const WORD_MASK: usize = 63;
 /// ## Basic Operations
 ///
 /// ```rust
-/// use prefix_tracker::AtomicBitmap;
+/// use keyspace_tracker::AtomicBitmap;
 ///
 /// let bitmap = AtomicBitmap::with_capacity(1000);
 ///
@@ -176,7 +176,7 @@ const WORD_MASK: usize = 63;
 /// ## Atomic Claim (Test-and-Set)
 ///
 /// ```rust
-/// use prefix_tracker::AtomicBitmap;
+/// use keyspace_tracker::AtomicBitmap;
 /// use std::sync::Arc;
 /// use std::thread;
 ///
@@ -197,7 +197,7 @@ const WORD_MASK: usize = 63;
 /// ## Scanning
 ///
 /// ```rust
-/// use prefix_tracker::AtomicBitmap;
+/// use keyspace_tracker::AtomicBitmap;
 ///
 /// let bitmap = AtomicBitmap::with_capacity(1000);
 /// bitmap.set(10);
@@ -242,7 +242,7 @@ impl AtomicBitmap {
     /// # Examples
     ///
     /// ```rust
-    /// use prefix_tracker::AtomicBitmap;
+    /// use keyspace_tracker::AtomicBitmap;
     ///
     /// let bitmap = AtomicBitmap::new();
     /// assert!(bitmap.capacity() >= 4096);
@@ -258,7 +258,7 @@ impl AtomicBitmap {
     /// # Examples
     ///
     /// ```rust
-    /// use prefix_tracker::AtomicBitmap;
+    /// use keyspace_tracker::AtomicBitmap;
     ///
     /// let bitmap = AtomicBitmap::with_capacity(1_000_000);
     /// assert!(bitmap.capacity() >= 1_000_000);

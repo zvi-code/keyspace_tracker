@@ -45,7 +45,7 @@ type FastDashMap<K, V> = DashMap<K, V, AHasher>;
 /// ## Simple Tracker
 ///
 /// ```rust
-/// use prefix_tracker::PrefixTracker;
+/// use keyspace_tracker::PrefixTracker;
 ///
 /// let tracker = PrefixTracker::simple("vec:");
 ///
@@ -69,7 +69,7 @@ type FastDashMap<K, V> = DashMap<K, V, AHasher>;
 /// ## Hierarchical Tracker
 ///
 /// ```rust
-/// use prefix_tracker::PrefixTracker;
+/// use keyspace_tracker::PrefixTracker;
 ///
 /// // For hash fields: hash:id -> { field0, field1, ... }
 /// let tracker = PrefixTracker::hierarchical("hash:");
@@ -88,7 +88,7 @@ type FastDashMap<K, V> = DashMap<K, V, AHasher>;
 /// ## Concurrent Claiming
 ///
 /// ```rust
-/// use prefix_tracker::PrefixTracker;
+/// use keyspace_tracker::PrefixTracker;
 /// use std::sync::Arc;
 /// use std::thread;
 ///
@@ -133,7 +133,7 @@ impl PrefixTracker {
     /// # Examples
     ///
     /// ```rust
-    /// use prefix_tracker::{PrefixTracker, TrackerConfig};
+    /// use keyspace_tracker::{PrefixTracker, TrackerConfig};
     ///
     /// let config = TrackerConfig::simple("myprefix:")
     ///     .with_max_id(1_000_000)
@@ -163,7 +163,7 @@ impl PrefixTracker {
     /// # Examples
     ///
     /// ```rust
-    /// use prefix_tracker::PrefixTracker;
+    /// use keyspace_tracker::PrefixTracker;
     ///
     /// let tracker = PrefixTracker::simple("vec:");
     /// tracker.add(42);
@@ -179,7 +179,7 @@ impl PrefixTracker {
     /// # Examples
     ///
     /// ```rust
-    /// use prefix_tracker::PrefixTracker;
+    /// use keyspace_tracker::PrefixTracker;
     ///
     /// let tracker = PrefixTracker::hierarchical("hash:");
     /// tracker.add_pair(1, 5);

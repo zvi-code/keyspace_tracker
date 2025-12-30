@@ -1,4 +1,4 @@
-# Benchmarking Guide for prefix_tracker
+# Benchmarking Guide for keyspace_tracker
 
 ## TL;DR - Maximum Performance
 
@@ -155,7 +155,7 @@ Check if NEON/AVX instructions are generated:
 cargo install cargo-asm
 
 # View assembly for a function
-cargo asm prefix_tracker::prefix_tracker::bitmap_simd::neon::popcount_slice
+cargo asm keyspace_tracker::keyspace_tracker::bitmap_simd::neon::popcount_slice
 ```
 
 Look for:

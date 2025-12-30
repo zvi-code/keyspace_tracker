@@ -1,4 +1,4 @@
-//! # prefix_tracker
+//! # keyspace_tracker
 //!
 //! High-performance, lock-free bitmap-based existence tracking for key-value systems.
 //!
@@ -14,7 +14,7 @@
 //! ## Quick Start
 //!
 //! ```rust
-//! use prefix_tracker::{PrefixGroupsTracker, TrackerConfig};
+//! use keyspace_tracker::{PrefixGroupsTracker, TrackerConfig};
 //!
 //! // Create a registry and register a tracker
 //! let groups = PrefixGroupsTracker::new();
@@ -40,16 +40,16 @@
 //! ```text
 //! ┌─────────────────────────────────────────────────────────────┐
 //! │                   PrefixGroupsTracker                       │
-//! │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐           │
-//! │  │ "user:"     │ │ "session:"  │ │ "cache:"    │  ...      │
-//! │  │ PrefixTracker│ │ PrefixTracker│ │ PrefixTracker│          │
-//! │  └──────┬──────┘ └──────┬──────┘ └──────┬──────┘           │
-//! │         │               │               │                   │
-//! │         ▼               ▼               ▼                   │
-//! │  ┌─────────────┐ ┌─────────────┐ ┌─────────────┐           │
-//! │  │AtomicBitmap │ │AtomicBitmap │ │AtomicBitmap │           │
-//! │  │ [0100101...] │ │ [1100010...]│ │ [0011100...]│           │
-//! │  └─────────────┘ └─────────────┘ └─────────────┘           │
+//! │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐         │
+//! │  │ "user:"      │ │ "session:"   │ │ "cache:"     │  .....  │
+//! │  │ PrefixTracker│ │ PrefixTracker│ │ PrefixTracker│         │
+//! │  └──────┬───────┘ └──────┬───────┘ └──────┬───────┘         │
+//! │         │               │                 │                 │
+//! │         ▼               ▼                 ▼                 │
+//! │  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐         │
+//! │  │AtomicBitmap  │ │AtomicBitmap  │ │AtomicBitmap  │         │
+//! │  │ [0100101...] │ │ [1100010...] │ │ [0011100...] │         │
+//! │  └──────────────┘ └──────────────┘ └──────────────┘         │
 //! └─────────────────────────────────────────────────────────────┘
 //! ```
 //!
@@ -79,7 +79,7 @@
 //! ### Simple Tracking
 //!
 //! ```rust
-//! use prefix_tracker::PrefixTracker;
+//! use keyspace_tracker::PrefixTracker;
 //!
 //! let tracker = PrefixTracker::simple("vec:");
 //!
@@ -100,7 +100,7 @@
 //! ### Hierarchical Tracking
 //!
 //! ```rust
-//! use prefix_tracker::PrefixTracker;
+//! use keyspace_tracker::PrefixTracker;
 //!
 //! // Track (id, sub_id) pairs - e.g., hash fields
 //! let tracker = PrefixTracker::hierarchical("hash:");
@@ -116,7 +116,7 @@
 //! ### Concurrent ID Claiming
 //!
 //! ```rust
-//! use prefix_tracker::PrefixTracker;
+//! use keyspace_tracker::PrefixTracker;
 //! use std::sync::Arc;
 //! use std::thread;
 //!
@@ -148,7 +148,7 @@
 //! ### Group Iteration with Policies
 //!
 //! ```rust
-//! use prefix_tracker::{PrefixGroupsTracker, TrackerConfig, ClaimPolicy};
+//! use keyspace_tracker::{PrefixGroupsTracker, TrackerConfig, ClaimPolicy};
 //!
 //! let groups = PrefixGroupsTracker::new();
 //! groups.register(TrackerConfig::simple("a:"));
@@ -185,6 +185,6 @@
 #![warn(rustdoc::missing_crate_level_docs)]
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-pub mod prefix_tracker;
+pub mod keyspace_tracker;
 
-pub use prefix_tracker::*;
+pub use keyspace_tracker::*;
