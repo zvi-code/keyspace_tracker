@@ -6,6 +6,24 @@
 
 High-performance, lock-free bitmap-based existence tracking for key-value systems.
 
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                   PrefixGroupsTracker                       │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐         │
+│  │ "user:"      │ │ "session:"   │ │ "cache:"     │  .....  │
+│  │ PrefixTracker│ │ PrefixTracker│ │ PrefixTracker│         │
+│  └──────┬───────┘ └──────┬───────┘ └──────┬───────┘         │
+│         │               │                 │                 │
+│         ▼               ▼                 ▼                 │
+│  ┌──────────────┐ ┌──────────────┐ ┌──────────────┐         │
+│  │AtomicBitmap  │ │AtomicBitmap  │ │AtomicBitmap  │         │
+│  │ [0100101...] │ │ [1100010...] │ │ [0011100...] │         │
+│  └──────────────┘ └──────────────┘ └──────────────┘         │
+└─────────────────────────────────────────────────────────────┘
+```
+
 ## Features
 
 - **Sub-nanosecond operations**: Core operations (test, set, claim) in 2-7ns
