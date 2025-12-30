@@ -1,15 +1,106 @@
-//! Atomic bitmap implementation.
+//! Atomic bitmap implementation with SIMD-accelerated operations.
 //!
 //! Provides a lock-free concurrent bitmap using `AtomicU64` words.
-//! Supports atomic set, clear, test, and test-and-set operations.
+//! Uses runtime CPU detection to select optimal implementations:
 //!
-//! Uses SIMD-optimized scanning on supported platforms (ARM NEON, x86 AVX2).
+//! - **ARM**: NEON baseline, with SVE/SVE2 for Graviton 3/4
+//! - **x86_64**: POPCNT baseline, AVX2 for Haswell+, AVX-512 for Skylake-X+
+//! - **Other**: Portable scalar fallback with loop unrolling
+//!
+//! All bit operations are atomic and safe for concurrent access.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use parking_lot::Mutex;
 
-use super::bitmap_simd;
+// Platform-specific implementations
+#[cfg(target_arch = "aarch64")]
+mod arm;
+mod scalar;
+#[cfg(target_arch = "x86_64")]
+mod x86;
+
+// Re-export platform capabilities for debugging/introspection
+#[cfg(target_arch = "aarch64")]
+pub use arm::ArmCapabilities;
+#[cfg(target_arch = "x86_64")]
+pub use x86::X86Capabilities;
+
+// ============================================================================
+// Internal SIMD Dispatch
+// ============================================================================
+
+/// Count set bits using the best available SIMD implementation.
+#[inline]
+fn simd_popcount_slice(words: &[AtomicU64]) -> u64 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        arm::popcount_slice(words)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86::popcount_slice(words)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        scalar::popcount_slice(words)
+    }
+}
+
+/// Find first non-zero word using SIMD-accelerated scan.
+#[inline]
+fn simd_find_first_nonzero(words: &[AtomicU64], start_word: usize) -> Option<(usize, u64)> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        arm::find_first_nonzero(words, start_word)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86::find_first_nonzero(words, start_word)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        scalar::find_first_nonzero(words, start_word)
+    }
+}
+
+/// Find first word with unset bits using SIMD-accelerated scan.
+#[inline]
+fn simd_find_first_not_full(words: &[AtomicU64], start_word: usize) -> Option<(usize, u64)> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        arm::find_first_not_full(words, start_word)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86::find_first_not_full(words, start_word)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        scalar::find_first_not_full(words, start_word)
+    }
+}
+
+/// Prefetch next cache line for iteration.
+#[inline]
+fn simd_prefetch_next_cacheline(words: &[AtomicU64], current_idx: usize) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        arm::prefetch_next_cacheline(words, current_idx);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        x86::prefetch_next_cacheline(words, current_idx);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        let _ = (words, current_idx);
+    }
+}
+
+// ============================================================================
+// Constants
+// ============================================================================
 
 /// Number of bits per word.
 const BITS_PER_WORD: usize = 64;
@@ -23,6 +114,10 @@ const WORD_SHIFT: usize = 6;
 /// Mask for bit index within word.
 const WORD_MASK: usize = 63;
 
+// ============================================================================
+// AtomicBitmap
+// ============================================================================
+
 /// A thread-safe, lock-free atomic bitmap.
 ///
 /// `AtomicBitmap` provides efficient storage and manipulation of a set of bits,
@@ -34,7 +129,7 @@ const WORD_MASK: usize = 63;
 /// - **Lock-free operations**: `test`, `set`, `clear`, `test_and_set` use atomic
 ///   compare-and-swap (CAS) and are wait-free for most operations
 /// - **Auto-growing**: Automatically expands when accessing indices beyond capacity
-/// - **SIMD-accelerated**: Uses ARM NEON or x86 AVX2 for bulk operations
+/// - **SIMD-accelerated**: Uses ARM NEON or x86 AVX2/POPCNT for bulk operations
 /// - **Memory efficient**: 1 bit per ID, 8 bytes per 64 IDs
 ///
 /// # Performance
@@ -480,7 +575,7 @@ impl AtomicBitmap {
         }
 
         // Use SIMD-optimized scan for remaining words
-        if let Some((word_idx, word)) = bitmap_simd::find_first_nonzero(words, start_word_idx + 1) {
+        if let Some((word_idx, word)) = simd_find_first_nonzero(words, start_word_idx + 1) {
             let bit = word.trailing_zeros() as usize;
             let index = (word_idx << WORD_SHIFT) + bit;
             if index < capacity {
@@ -518,7 +613,7 @@ impl AtomicBitmap {
         }
 
         // Use SIMD-optimized scan for remaining words
-        if let Some((word_idx, word)) = bitmap_simd::find_first_not_full(words, start_word_idx + 1) {
+        if let Some((word_idx, word)) = simd_find_first_not_full(words, start_word_idx + 1) {
             let bit = (!word).trailing_zeros() as usize;
             let index = (word_idx << WORD_SHIFT) + bit;
             if index < limit {
@@ -532,9 +627,9 @@ impl AtomicBitmap {
     /// Recompute population count using SIMD-optimized counting.
     ///
     /// This is useful after bulk operations or to verify the incremental count.
-    /// Uses NEON on ARM, POPCNT on x86_64, with scalar fallback.
+    /// Uses NEON on ARM, POPCNT/AVX2 on x86_64, with scalar fallback.
     pub fn recompute_count(&self) -> u64 {
-        bitmap_simd::popcount_slice(self.words())
+        simd_popcount_slice(self.words())
     }
 
     /// Verify and fix the population count if it has drifted.
@@ -556,7 +651,7 @@ impl AtomicBitmap {
     /// Call this during iteration to reduce cache misses.
     #[inline]
     pub fn prefetch_ahead(&self, current_word_idx: usize) {
-        bitmap_simd::prefetch_next_cacheline(self.words(), current_word_idx);
+        simd_prefetch_next_cacheline(self.words(), current_word_idx);
     }
 
     /// Get the density of the bitmap (ratio of set bits to capacity).
@@ -585,6 +680,32 @@ impl std::fmt::Debug for AtomicBitmap {
             .finish()
     }
 }
+
+// ============================================================================
+// Public API re-exports for advanced usage
+// ============================================================================
+
+/// Print detected CPU capabilities for debugging.
+pub fn print_cpu_capabilities() {
+    #[cfg(target_arch = "aarch64")]
+    {
+        let caps = ArmCapabilities::get();
+        println!("ARM Capabilities: {:?}", caps);
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        let caps = X86Capabilities::get();
+        println!("x86_64 Capabilities: {:?}", caps);
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        println!("Using scalar fallback (no SIMD)");
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -785,5 +906,23 @@ mod tests {
         bm.reset();
         assert_eq!(bm.count(), 0);
         assert_eq!(bm.capacity(), cap); // Capacity preserved
+    }
+
+    #[test]
+    fn test_recompute_count() {
+        let bm = AtomicBitmap::new();
+
+        for i in 0..100 {
+            bm.set(i);
+        }
+
+        assert_eq!(bm.recompute_count(), 100);
+        assert_eq!(bm.count(), 100);
+    }
+
+    #[test]
+    fn test_cpu_capabilities() {
+        // Just ensure this doesn't panic
+        print_cpu_capabilities();
     }
 }

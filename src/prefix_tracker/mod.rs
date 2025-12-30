@@ -32,13 +32,17 @@
 //! ```
 
 mod bitmap;
-mod bitmap_simd;
 mod config;
 mod group_iter;
 mod iterators;
 mod tracker;
 
 pub use bitmap::AtomicBitmap;
+#[cfg(target_arch = "aarch64")]
+pub use bitmap::ArmCapabilities;
+#[cfg(target_arch = "x86_64")]
+pub use bitmap::X86Capabilities;
+pub use bitmap::print_cpu_capabilities;
 pub use config::{
     BitFilter, ClaimPolicy, IdRange, IterOrder, PrefixFilter, PrefixWeight, TrackerConfig,
 };
