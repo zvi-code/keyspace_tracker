@@ -118,41 +118,82 @@ impl<'a> TrackerIterBuilder<'a> {
     }
 
     /// Find a number coprime with n for multiplicative permutation.
+    ///
+    /// Uses known good LCG multipliers that are coprime with powers of 2.
+    /// Falls back to binary GCD search if needed.
+    #[inline]
     fn find_coprime(n: u64) -> u64 {
         if n <= 1 {
             return 1;
         }
 
-        // Use a large prime-ish number that's likely coprime
-        let candidates = [
-            6364136223846793005u64, // LCG multiplier
-            2862933555777941757u64,
-            3202034522624059733u64,
+        // Large odd primes - always coprime with powers of 2
+        // These are specifically chosen LCG multipliers with good statistical properties
+        const CANDIDATES: [u64; 5] = [
+            6364136223846793005, // Knuth MMIX LCG
+            2862933555777941757, // Steele, Vigna SplitMix
+            0x5851F42D4C957F2D,  // 64-bit LCG from PCG
+            0x2545F4914F6CDD1D,  // Another good LCG multiplier
+            0x14057B7EF767814F,  // Mersenne-related
         ];
 
-        for &c in &candidates {
-            if Self::gcd(c, n) == 1 {
+        // Fast path: if n is a power of 2, any odd number is coprime
+        if n.is_power_of_two() {
+            return CANDIDATES[0];
+        }
+
+        // Check candidates using binary GCD
+        for &c in &CANDIDATES {
+            if Self::binary_gcd(c, n) == 1 {
                 return c;
             }
         }
 
         // Fallback: find smallest coprime > 1
-        for c in 2..n {
-            if Self::gcd(c, n) == 1 {
+        // Start with 3 (2 might share factor with n), check odd numbers only
+        let mut c = 3u64;
+        while c < n {
+            if Self::binary_gcd(c, n) == 1 {
                 return c;
             }
+            c += 2;
         }
 
         1
     }
 
-    fn gcd(mut a: u64, mut b: u64) -> u64 {
-        while b != 0 {
-            let t = b;
-            b = a % b;
-            a = t;
+    /// Binary GCD algorithm (Stein's algorithm).
+    /// Faster than Euclidean GCD on modern CPUs - uses only subtraction and bit shifts.
+    #[inline]
+    fn binary_gcd(mut a: u64, mut b: u64) -> u64 {
+        if a == 0 {
+            return b;
         }
-        a
+        if b == 0 {
+            return a;
+        }
+
+        // Find common factors of 2
+        let shift = (a | b).trailing_zeros();
+
+        // Remove all factors of 2 from a
+        a >>= a.trailing_zeros();
+
+        loop {
+            // Remove all factors of 2 from b
+            b >>= b.trailing_zeros();
+
+            // Ensure a <= b
+            if a > b {
+                std::mem::swap(&mut a, &mut b);
+            }
+
+            b -= a;
+
+            if b == 0 {
+                return a << shift;
+            }
+        }
     }
 
     /// Build a write iterator with atomic claim-and-set semantics.

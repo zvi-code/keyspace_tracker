@@ -698,11 +698,92 @@ fn bench_simd_scan_full(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_hash_operations(c: &mut Criterion) {
+    let mut group = c.benchmark_group("hash");
+    
+    // Benchmark hierarchical tracker operations (uses DashMap with AHash)
+    let tracker = PrefixTracker::hierarchical("bench:");
+    
+    // Pre-populate
+    for id in 0..1000u64 {
+        for sub_id in 0..10u64 {
+            tracker.add_pair(id, sub_id);
+        }
+    }
+    
+    group.bench_function("hierarchical/exists_pair", |b| {
+        let mut i = 0u64;
+        b.iter(|| {
+            let id = i % 1000;
+            let sub_id = i % 10;
+            i = i.wrapping_add(1);
+            black_box(tracker.exists_pair(id, sub_id))
+        })
+    });
+    
+    group.bench_function("hierarchical/add_pair_existing", |b| {
+        let mut i = 0u64;
+        b.iter(|| {
+            let id = i % 1000;
+            let sub_id = i % 10;
+            i = i.wrapping_add(1);
+            black_box(tracker.add_pair(id, sub_id))
+        })
+    });
+    
+    // Benchmark PrefixGroupsTracker operations
+    let groups = PrefixGroupsTracker::new();
+    for i in 0..100 {
+        groups.register(TrackerConfig::simple(&format!("prefix{}:", i)));
+    }
+    
+    group.bench_function("groups/get_existing", |b| {
+        let mut i = 0u64;
+        b.iter(|| {
+            let prefix = format!("prefix{}:", i % 100);
+            i = i.wrapping_add(1);
+            black_box(groups.get(&prefix))
+        })
+    });
+    
+    group.finish();
+}
+
+fn bench_random_iter_coprime(c: &mut Criterion) {
+    // Benchmark the random iterator which uses coprime calculation
+    let mut group = c.benchmark_group("random_iter");
+    
+    for size in [1_000, 10_000, 100_000] {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("rand:").with_max_id(size as u64));
+        
+        // Set 50% of bits
+        for i in (0..size).step_by(2) {
+            tracker.add(i as u64);
+        }
+        
+        group.throughput(Throughput::Elements(size as u64 / 2));
+        group.bench_with_input(BenchmarkId::new("iterate_set", size), &size, |b, _| {
+            b.iter(|| {
+                let items: Vec<_> = tracker.iter().set_only().random().collect();
+                black_box(items.len())
+            })
+        });
+    }
+    
+    group.finish();
+}
+
 criterion_group!(
     simd_benches,
     bench_simd_popcount,
     bench_simd_find_next,
     bench_simd_scan_full,
+);
+
+criterion_group!(
+    hash_benches,
+    bench_hash_operations,
+    bench_random_iter_coprime,
 );
 
 criterion_main!(
@@ -714,4 +795,5 @@ criterion_main!(
     scaling_benches,
     concurrent_benches,
     simd_benches,
+    hash_benches,
 );

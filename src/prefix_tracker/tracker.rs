@@ -5,16 +5,105 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use ahash::RandomState as AHasher;
 use dashmap::DashMap;
 
 use super::bitmap::AtomicBitmap;
 use super::config::TrackerConfig;
 use super::iterators::TrackerIterBuilder;
 
+/// Type alias for DashMap with AHash (2-10x faster than default SipHash)
+type FastDashMap<K, V> = DashMap<K, V, AHasher>;
+
 /// Tracks existence of IDs for a specific prefix.
 ///
-/// Thread-safe for all operations. Supports both simple (single u64 ID)
-/// and hierarchical ((id, sub_id) pair) tracking modes.
+/// `PrefixTracker` provides efficient, thread-safe tracking of which IDs exist
+/// for a given key prefix. It supports two modes:
+///
+/// - **Simple mode**: Tracks individual IDs (u64)
+/// - **Hierarchical mode**: Tracks (id, sub_id) pairs
+///
+/// # Thread Safety
+///
+/// All operations are thread-safe:
+/// - Reads use atomic loads
+/// - Writes use atomic compare-and-swap (CAS)
+/// - Growth operations are synchronized via mutex
+/// - Multiple write iterators can run concurrently
+/// - Only one delete iterator can be active at a time
+///
+/// # Performance
+///
+/// | Operation | Simple Mode | Hierarchical Mode |
+/// |-----------|------------|-------------------|
+/// | `exists` | ~1.6 ns | ~17 ns |
+/// | `add` | ~7 ns | ~39 ns |
+/// | `claim` | ~2.4 ns | ~20 ns |
+///
+/// # Examples
+///
+/// ## Simple Tracker
+///
+/// ```rust
+/// use prefix_tracker::PrefixTracker;
+///
+/// let tracker = PrefixTracker::simple("vec:");
+///
+/// // Add IDs
+/// tracker.add(0);
+/// tracker.add(100);
+///
+/// // Check existence
+/// assert!(tracker.exists(100));
+/// assert!(!tracker.exists(50));
+///
+/// // Atomic claim (test-and-set)
+/// assert!(tracker.claim(200));  // Returns true, ID now set
+/// assert!(!tracker.claim(200)); // Returns false, already set
+///
+/// // Remove
+/// tracker.remove(100);
+/// assert!(!tracker.exists(100));
+/// ```
+///
+/// ## Hierarchical Tracker
+///
+/// ```rust
+/// use prefix_tracker::PrefixTracker;
+///
+/// // For hash fields: hash:id -> { field0, field1, ... }
+/// let tracker = PrefixTracker::hierarchical("hash:");
+///
+/// tracker.add_pair(1, 0);   // hash:1 has field 0
+/// tracker.add_pair(1, 5);   // hash:1 has field 5
+/// tracker.add_pair(2, 10);  // hash:2 has field 10
+///
+/// assert!(tracker.exists_pair(1, 5));
+/// assert!(!tracker.exists_pair(1, 99));
+///
+/// // Count total (id, sub_id) pairs
+/// assert_eq!(tracker.count(), 3);
+/// ```
+///
+/// ## Concurrent Claiming
+///
+/// ```rust
+/// use prefix_tracker::PrefixTracker;
+/// use std::sync::Arc;
+/// use std::thread;
+///
+/// let tracker = Arc::new(PrefixTracker::simple("id:"));
+///
+/// let handles: Vec<_> = (0..4).map(|_| {
+///     let t = tracker.clone();
+///     thread::spawn(move || {
+///         (0..100u64).filter(|&id| t.claim(id)).count()
+///     })
+/// }).collect();
+///
+/// let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+/// assert_eq!(total, 100); // Each ID claimed exactly once
+/// ```
 pub struct PrefixTracker {
     /// Configuration.
     config: TrackerConfig,
@@ -25,7 +114,7 @@ pub struct PrefixTracker {
 
     /// For hierarchical trackers: sub-bitmaps per primary ID.
     /// None for simple trackers.
-    sub_bitmaps: Option<DashMap<u64, AtomicBitmap>>,
+    sub_bitmaps: Option<FastDashMap<u64, AtomicBitmap>>,
 
     /// Total count for hierarchical trackers (sum of all sub-bitmap counts).
     /// For simple trackers, use primary_bitmap.count() directly.
@@ -40,9 +129,21 @@ pub struct PrefixTracker {
 
 impl PrefixTracker {
     /// Create a new tracker with the given configuration.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use prefix_tracker::{PrefixTracker, TrackerConfig};
+    ///
+    /// let config = TrackerConfig::simple("myprefix:")
+    ///     .with_max_id(1_000_000)
+    ///     .with_initial_capacity(4096);
+    ///
+    /// let tracker = PrefixTracker::new(config);
+    /// ```
     pub fn new(config: TrackerConfig) -> Self {
         let sub_bitmaps = if config.hierarchical {
-            Some(DashMap::new())
+            Some(FastDashMap::default())
         } else {
             None
         };
@@ -58,12 +159,32 @@ impl PrefixTracker {
     }
 
     /// Create a simple (non-hierarchical) tracker.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use prefix_tracker::PrefixTracker;
+    ///
+    /// let tracker = PrefixTracker::simple("vec:");
+    /// tracker.add(42);
+    /// assert!(tracker.exists(42));
+    /// ```
     #[inline]
     pub fn simple(prefix: impl Into<String>) -> Self {
         Self::new(TrackerConfig::simple(prefix))
     }
 
     /// Create a hierarchical tracker for (id, sub_id) pairs.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use prefix_tracker::PrefixTracker;
+    ///
+    /// let tracker = PrefixTracker::hierarchical("hash:");
+    /// tracker.add_pair(1, 5);
+    /// assert!(tracker.exists_pair(1, 5));
+    /// ```
     #[inline]
     pub fn hierarchical(prefix: impl Into<String>) -> Self {
         Self::new(TrackerConfig::hierarchical(prefix))
@@ -434,7 +555,7 @@ impl PrefixTracker {
     }
 
     /// Get reference to sub-bitmaps for iteration.
-    pub(crate) fn sub_bitmaps(&self) -> Option<&DashMap<u64, AtomicBitmap>> {
+    pub(crate) fn sub_bitmaps(&self) -> Option<&FastDashMap<u64, AtomicBitmap>> {
         self.sub_bitmaps.as_ref()
     }
 

@@ -158,7 +158,7 @@ impl<'a> GroupIterBuilder<'a> {
     /// Build an exclusive delete iterator with the specified claim policy.
     ///
     /// Returns `None` if any of the trackers already has an active delete iterator.
-    pub fn delete(self, policy: ClaimPolicy) -> Option<GroupDeleteIter> {
+    pub fn delete(self, _policy: ClaimPolicy) -> Option<GroupDeleteIter> {
         let trackers = self.filtered_trackers();
 
         // Try to acquire delete locks on all trackers

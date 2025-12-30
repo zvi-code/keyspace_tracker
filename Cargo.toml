@@ -2,13 +2,25 @@
 name = "prefix_tracker"
 version = "0.1.0"
 edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
 description = "High-performance bitmap-based existence tracking for key-value systems"
-license = "MIT"
+license = "BSD-3-Clause"
+repository = "https://github.com/yourusername/prefix_tracker"
+documentation = "https://docs.rs/prefix_tracker"
+readme = "README.md"
+keywords = ["bitmap", "tracking", "cache", "concurrent", "high-performance"]
+categories = ["data-structures", "concurrency", "caching"]
+rust-version = "1.70"
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 dashmap = "6"
 parking_lot = "0.12"
 fastrand = "2"
+ahash = "0.8"
 
 [dev-dependencies]
 criterion = "0.5"
@@ -17,12 +29,37 @@ criterion = "0.5"
 name = "benchmarks"
 harness = false
 
+# =============================================================================
+# Release Profile - Production builds
+# =============================================================================
 [profile.release]
-lto = "thin"
-codegen-units = 1
 opt-level = 3
+lto = "fat"              # Full LTO for cross-crate inlining
+codegen-units = 1        # Single codegen unit for global optimization
+panic = "abort"          # Skip unwinding overhead
+overflow-checks = false  # Disable overflow checks in release
+debug = false            # No debug info
 
+# =============================================================================
+# Bench Profile - Maximum performance for benchmarks
+# Inherits from release, panic setting must match release
+# =============================================================================
 [profile.bench]
-lto = "thin"
-codegen-units = 1
 opt-level = 3
+lto = "fat"
+codegen-units = 1
+overflow-checks = false
+debug = false
+
+# =============================================================================
+# Dev Profile - Fast compile, some optimization
+# =============================================================================
+[profile.dev]
+opt-level = 1            # Some optimization for faster dev testing
+overflow-checks = true   # Keep safety checks in dev
+
+# =============================================================================
+# Test Profile - Balance between speed and debug info
+# =============================================================================
+[profile.test]
+opt-level = 2            # Moderate optimization for tests

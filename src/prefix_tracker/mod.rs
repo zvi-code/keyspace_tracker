@@ -53,15 +53,82 @@ pub use tracker::PrefixTracker;
 
 use std::sync::Arc;
 
+use ahash::RandomState as AHasher;
 use dashmap::DashMap;
 
-/// Registry of `PrefixTracker`s, one per prefix.
+/// Type alias for DashMap with AHash (2-10x faster than default SipHash)
+type FastDashMap<K, V> = DashMap<K, V, AHasher>;
+
+/// Registry of [`PrefixTracker`]s, one per prefix.
 ///
-/// Thread-safe for concurrent access. Provides group-level iteration
-/// across multiple trackers.
+/// `PrefixGroupsTracker` is a thread-safe collection that manages multiple
+/// trackers, each identified by a unique prefix string. It provides:
+///
+/// - Concurrent registration and lookup of trackers
+/// - Group-level iteration across all prefixes
+/// - Automatic tracker creation with default configuration
+///
+/// # Thread Safety
+///
+/// All operations are thread-safe. The internal map uses [`DashMap`] with
+/// [AHash](https://docs.rs/ahash) for high-performance concurrent access.
+///
+/// # Examples
+///
+/// ## Basic Usage
+///
+/// ```rust
+/// use prefix_tracker::{PrefixGroupsTracker, TrackerConfig};
+///
+/// let groups = PrefixGroupsTracker::new();
+///
+/// // Register trackers with custom configuration
+/// groups.register(TrackerConfig::simple("user:").with_max_id(1_000_000));
+/// groups.register(TrackerConfig::simple("session:").with_max_id(100_000));
+///
+/// // Get and use trackers
+/// let users = groups.get("user:").unwrap();
+/// users.add(42);
+/// ```
+///
+/// ## Auto-Creation with Default Config
+///
+/// ```rust
+/// use prefix_tracker::{PrefixGroupsTracker, TrackerConfig};
+///
+/// // Set a default config for auto-created trackers
+/// let groups = PrefixGroupsTracker::with_default_config(
+///     TrackerConfig::simple("").with_max_id(10_000)
+/// );
+///
+/// // get_or_create auto-creates if not exists
+/// let tracker = groups.get_or_create("new_prefix:");
+/// tracker.add(1);
+/// ```
+///
+/// ## Group Iteration
+///
+/// ```rust
+/// use prefix_tracker::{PrefixGroupsTracker, TrackerConfig, ClaimPolicy};
+///
+/// let groups = PrefixGroupsTracker::new();
+/// groups.register(TrackerConfig::simple("a:"));
+/// groups.register(TrackerConfig::simple("b:"));
+///
+/// // Iterate across all prefixes
+/// for item in groups.iter().set_only().horizontal().build() {
+///     println!("{}:{}", item.prefix, item.id);
+/// }
+///
+/// // Claim IDs with round-robin policy
+/// let mut writer = groups.iter().write(ClaimPolicy::RoundRobin);
+/// while let Some(item) = writer.next() {
+///     // Each claimed ID is unique across all threads
+/// }
+/// ```
 pub struct PrefixGroupsTracker {
     /// Map from prefix string to tracker.
-    trackers: DashMap<String, Arc<PrefixTracker>>,
+    trackers: FastDashMap<String, Arc<PrefixTracker>>,
 
     /// Default configuration for auto-created trackers.
     default_config: TrackerConfig,
@@ -69,9 +136,18 @@ pub struct PrefixGroupsTracker {
 
 impl PrefixGroupsTracker {
     /// Create a new empty registry.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use prefix_tracker::PrefixGroupsTracker;
+    ///
+    /// let groups = PrefixGroupsTracker::new();
+    /// assert_eq!(groups.len(), 0);
+    /// ```
     pub fn new() -> Self {
         Self {
-            trackers: DashMap::new(),
+            trackers: FastDashMap::default(),
             default_config: TrackerConfig::default(),
         }
     }
@@ -79,7 +155,7 @@ impl PrefixGroupsTracker {
     /// Create a new registry with custom default configuration.
     pub fn with_default_config(config: TrackerConfig) -> Self {
         Self {
-            trackers: DashMap::new(),
+            trackers: FastDashMap::default(),
             default_config: config,
         }
     }

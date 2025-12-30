@@ -52,6 +52,7 @@ pub fn prefetch_read<T>(ptr: *const T) {
 }
 
 /// Prefetch data for writing
+#[allow(dead_code)]
 #[inline(always)]
 pub fn prefetch_write<T>(ptr: *const T) {
     #[cfg(target_arch = "aarch64")]
@@ -166,22 +167,20 @@ mod neon {
                 prefetch_read(words[i + WORDS_PER_CACHE_LINE..].as_ptr());
             }
 
-            unsafe {
-                let w0 = words[i].load(Ordering::Relaxed);
-                let w1 = words[i + 1].load(Ordering::Relaxed);
-                let w2 = words[i + 2].load(Ordering::Relaxed);
-                let w3 = words[i + 3].load(Ordering::Relaxed);
+            let w0 = words[i].load(Ordering::Relaxed);
+            let w1 = words[i + 1].load(Ordering::Relaxed);
+            let w2 = words[i + 2].load(Ordering::Relaxed);
+            let w3 = words[i + 3].load(Ordering::Relaxed);
 
-                // Quick check: OR all words together
-                let any_set = w0 | w1 | w2 | w3;
-                if any_set != 0 {
-                    // At least one is non-zero, find which one
-                    if w0 != 0 { return Some((i, w0)); }
-                    if w1 != 0 { return Some((i + 1, w1)); }
-                    if w2 != 0 { return Some((i + 2, w2)); }
-                    return Some((i + 3, w3));
-                }
-            }
+            // Quick check: OR all words together
+            let any_set = w0 | w1 | w2 | w3;
+            if any_set != 0 {
+                // At least one is non-zero, find which one
+                if w0 != 0 { return Some((i, w0)); }
+                if w1 != 0 { return Some((i + 1, w1)); }
+                if w2 != 0 { return Some((i + 2, w2)); }
+                return Some((i + 3, w3));
+            }            
 
             i += 4;
         }
@@ -412,6 +411,7 @@ mod avx2 {
 // Scalar Fallback
 // ============================================================================
 
+#[allow(dead_code)]
 mod scalar {
     use super::*;
 
