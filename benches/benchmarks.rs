@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
-use prefix_tracker::{
+use keyspace_tracker::{
     AtomicBitmap, PrefixTracker, PrefixGroupsTracker, TrackerConfig, ClaimPolicy,
 };
 use std::sync::Arc;

@@ -2,10 +2,10 @@
 name = "keyspace_tracker"
 version = "0.1.0"
 edition = "2021"
-authors = ["Your Name <your.email@example.com>"]
-description = "High-performance bitmap-based existence tracking for key-value systems"
+authors = ["Zvi Schneider <z2357@outlook.com>"]
+description = "High-performance bitmap-based existence tracking for keyspaces arranged by prefix."
 license = "BSD-3-Clause"
-repository = "https://github.com/yourusername/keyspace_tracker"
+repository = "https://github.com/zvi-code/keyspace_tracker"
 documentation = "https://docs.rs/keyspace_tracker"
 readme = "README.md"
 keywords = ["bitmap", "tracking", "cache", "concurrent", "high-performance"]

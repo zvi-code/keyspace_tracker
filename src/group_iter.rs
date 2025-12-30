@@ -857,7 +857,7 @@ impl Iterator for GroupPartitionedIter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keyspace_tracker::TrackerConfig;
+    use crate::TrackerConfig;
 
     fn create_test_trackers() -> Vec<Arc<PrefixTracker>> {
         let t1 = Arc::new(PrefixTracker::new(
