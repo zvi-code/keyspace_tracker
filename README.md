@@ -33,10 +33,13 @@ High-performance, lock-free bitmap-based existence tracking for key-value system
 - **Memory efficient**: 1 bit per ID, auto-growing bitmaps
 - **Hierarchical support**: Track (id, sub_id) pairs efficiently
 - **Rich iteration**: Sequential, random, write (claim), delete, partitioned iterators
+- **Sampling & distributions**: Mixed-ratio, probabilistic sampling, Zipfian, hotspot patterns
+- **Bulk operations**: Set/clear ranges efficiently with SIMD acceleration
 - **Group operations**: Iterate across multiple prefixes with various policies
 
 ## Use Cases
 
+- **Database benchmarking**: Track key existence for workload generation (see [INTEGRATION_GUIDE.md](INTEGRATION_GUIDE.md))
 - **Cache existence tracking**: Know which keys exist without fetching values
 - **Backfill completion tracking**: Track which IDs have been processed
 - **Distributed ID allocation**: Claim unique IDs across threads/processes
@@ -93,6 +96,11 @@ if bitmap.test_and_set(100) {
 // Find next set/unset bit
 let next_set = bitmap.find_next_set(0);
 let next_unset = bitmap.find_next_unset(0, 1_000_000);
+
+// Bulk operations (SIMD accelerated)
+bitmap.set_range(0, 10_000);        // Set bits [0, 10000)
+bitmap.clear_range(5_000, 7_500);   // Clear bits [5000, 7500)
+let count = bitmap.count_range(0, 10_000);  // Count set bits in range
 ```
 
 ### `PrefixTracker`
@@ -190,6 +198,78 @@ Memory-efficient pseudo-random traversal:
 for (id, _) in tracker.iter().set_only().random() {
     // Visits each set ID exactly once in random order
 }
+
+// Reproducible random with seed
+for (id, _) in tracker.iter().set_only().seed(42).random() {
+    // Same sequence every time with seed 42
+}
+```
+
+### Sampling Iterator
+
+Flexible sampling for benchmark workloads:
+
+```rust
+// Limit number of items returned
+for (id, _) in tracker.iter().set_only().limit(1000).sequential() {
+    // Returns at most 1000 items
+}
+
+// Probabilistic sampling (~50% of keys)
+for (id, _) in tracker.iter().set_only().sample(0.5).sequential() {
+    // Each key has 50% chance of being returned
+}
+
+// Mixed-ratio: 90% existing + 10% new keys
+for (id, _) in tracker.iter().mixed_ratio(0.9).random() {
+    // 90% of returned IDs are set, 10% are unset
+}
+
+// Range-relative iteration (upper 50% of keyspace)
+for (id, _) in tracker.iter().set_only().range_percent(0.5, 1.0).sequential() {
+    // Only IDs in upper half of keyspace
+}
+
+// Combine options
+for (id, _) in tracker.iter()
+    .mixed_ratio(0.9)
+    .sample(0.5)
+    .limit(10_000)
+    .seed(42)
+    .random()
+{
+    // Complex workload pattern
+}
+```
+
+### Access Distributions
+
+Realistic workload patterns for benchmarking:
+
+```rust
+use keyspace_tracker::{SamplingConfig, AccessDistribution};
+
+// Zipfian distribution (popular keys accessed more)
+let config = SamplingConfig::new()
+    .with_distribution(AccessDistribution::Zipfian { skew: 0.99 });
+
+// Hotspot (20% of keys get 80% of traffic)
+let config = SamplingConfig::new()
+    .with_distribution(AccessDistribution::Hotspot { 
+        hot_pct: 0.2, 
+        hot_prob: 0.8 
+    });
+
+// Latest (recent keys accessed more)
+let config = SamplingConfig::new()
+    .with_distribution(AccessDistribution::Latest { 
+        recent_pct: 0.1, 
+        recent_prob: 0.9 
+    });
+
+for (id, _) in tracker.iter().with_sampling(config).random() {
+    // Access pattern follows distribution
+}
 ```
 
 ### Write Iterator
@@ -245,6 +325,26 @@ let handles: Vec<_> = partitions
     .collect();
 
 let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+```
+
+### Overlapping Mode (Contention Testing)
+
+All partitions iterate the full range for lock contention testing:
+
+```rust
+// Each partition sees all keys (for contention benchmarks)
+let partitions = tracker.iter()
+    .set_only()
+    .overlapping()  // Enable overlapping mode
+    .seed(42)
+    .partitioned(4);
+
+// Each partition iterates the full keyspace
+for partition in partitions {
+    for (id, _) in partition {
+        // All threads may access same keys
+    }
+}
 ```
 
 ## Group Iteration
@@ -306,6 +406,7 @@ Benchmarked on Apple M2 (ARM64):
 | `find_next_unset` | Varies | O(density) |
 | Hierarchical `exists_pair` | 17 ns | DashMap + bitmap |
 | Hierarchical `add_pair` | 39 ns | DashMap + bitmap |
+| Iterator per-key | 2.5-5 ns | All iteration modes |
 
 ### Scaling
 
@@ -394,6 +495,11 @@ All types are `Send + Sync`:
 - `PrefixGroupsTracker`: Concurrent access via DashMap with AHash
 - `WriteIter`: Multiple writers can run concurrently
 - `DeleteIter`: Exclusive (only one per tracker)
+
+## Documentation
+
+- [INTEGRATION_GUIDE.md](INTEGRATION_GUIDE.md) - Detailed guide for database benchmarking integration
+- [BENCHMARKING.md](BENCHMARKING.md) - Performance tuning and benchmark configuration
 
 ## License
 
