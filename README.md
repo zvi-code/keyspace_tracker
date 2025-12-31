@@ -6,6 +6,8 @@
 
 Simulate real-world application workloads. Track keyspace state and iterate with composable patterns: thread partitioning, Zipfian/hotspot distributions, atomic claiming, sampling—lock-free primitives for building realistic benchmarks.
 
+Note: Initially this was designed to integrate in https://github.com/zvi-code/valkey-bench-rs, but written as independant tool for other possible usages
+
 ## Architecture
 
 ```
