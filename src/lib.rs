@@ -1,6 +1,8 @@
 //! # keyspace_tracker
 //!
-//! High-performance, lock-free bitmap-based existence tracking for key-value systems.
+//! Simulate real-world application workloads. Track keyspace state and iterate with
+//! composable patterns: thread partitioning, Zipfian/hotspot distributions, atomic
+//! claiming, sampling—lock-free primitives for building realistic benchmarks.
 //!
 //! ## Features
 //!

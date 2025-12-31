@@ -3,13 +3,13 @@ name = "keyspace_tracker"
 version = "0.1.0"
 edition = "2021"
 authors = ["Zvi Schneider <z2357@outlook.com>"]
-description = "High-performance bitmap-based existence tracking for keyspaces arranged by prefix."
+description = "Simulate real-world workloads. Track keyspace state with composable iterators: thread partitioning, Zipfian/hotspot distributions, atomic claiming—lock-free primitives for realistic benchmarks."
 license = "BSD-3-Clause"
 repository = "https://github.com/zvi-code/keyspace_tracker"
 documentation = "https://docs.rs/keyspace_tracker"
 readme = "README.md"
-keywords = ["bitmap", "tracking", "cache", "concurrent", "high-performance"]
-categories = ["data-structures", "concurrency", "caching"]
+keywords = ["benchmark", "iterator", "workload", "concurrent", "simulation"]
+categories = ["development-tools::profiling", "simulation", "concurrency"]
 rust-version = "1.70"
 
 [package.metadata.docs.rs]

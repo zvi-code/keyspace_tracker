@@ -4,7 +4,7 @@
 [![Documentation](https://docs.rs/keyspace_tracker/badge.svg)](https://docs.rs/keyspace_tracker)
 [![License](https://img.shields.io/badge/License-BSD_3--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
 
-High-performance, lock-free bitmap-based existence tracking for key-value systems.
+Simulate real-world application workloads. Track keyspace state and iterate with composable patterns: thread partitioning, Zipfian/hotspot distributions, atomic claiming, sampling—lock-free primitives for building realistic benchmarks.
 
 ## Architecture
 
