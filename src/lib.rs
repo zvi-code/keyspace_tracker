@@ -211,6 +211,26 @@ pub use iterators::{
 };
 pub use tracker::PrefixTracker;
 
+// =============================================================================
+// Documentation Modules
+// =============================================================================
+
+/// Integration guide for keyspace_tracker.
+///
+/// This module contains the full integration specification for using
+/// keyspace_tracker with database benchmarking tools.
+#[cfg(doc)]
+#[doc = include_str!("../INTEGRATION_GUIDE.md")]
+pub mod integration_guide {}
+
+/// Benchmarking guide for keyspace_tracker.
+///
+/// This module contains performance tuning and benchmarking guidance
+/// for achieving maximum performance on various platforms.
+#[cfg(doc)]
+#[doc = include_str!("../BENCHMARKING.md")]
+pub mod benchmarking {}
+
 use std::sync::Arc;
 
 use ahash::RandomState as AHasher;

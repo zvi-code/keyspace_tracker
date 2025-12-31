@@ -1,0 +1,12 @@
+[book]
+title = "keyspace_tracker"
+authors = ["Zvi Schneider"]
+description = "High-performance bitmap-based existence tracking"
+src = "src"
+
+[build]
+build-dir = "../target/book"
+
+[output.html]
+git-repository-url = "https://github.com/zvi-code/keyspace_tracker"
+edit-url-template = "https://github.com/zvi-code/keyspace_tracker/edit/mainline/docs/{path}"
