@@ -6,10 +6,11 @@
 //! - `WriteIter`: Concurrent write with atomic claim-and-set
 //! - `DeleteIter`: Exclusive delete iteration
 //! - `PartitionedIter`: Parallel iteration with disjoint ranges
+//! - `SamplingIter`: Wrapper for mixed-ratio and probabilistic sampling
 
 use std::sync::atomic::Ordering;
 
-use super::config::{BitFilter, IdRange};
+use super::config::{BitFilter, IdRange, SamplingConfig};
 use super::tracker::PrefixTracker;
 
 /// Item yielded by tracker iterators.
@@ -23,6 +24,7 @@ pub struct TrackerIterBuilder<'a> {
     tracker: &'a PrefixTracker,
     range: IdRange,
     filter: BitFilter,
+    sampling: SamplingConfig,
 }
 
 impl<'a> TrackerIterBuilder<'a> {
@@ -32,6 +34,7 @@ impl<'a> TrackerIterBuilder<'a> {
             tracker,
             range: IdRange::unbounded(),
             filter: BitFilter::All,
+            sampling: SamplingConfig::new(),
         }
     }
 
@@ -79,6 +82,90 @@ impl<'a> TrackerIterBuilder<'a> {
         self
     }
 
+    // ========================================================================
+    // Sampling Configuration
+    // ========================================================================
+
+    /// Set mixed ratio: proportion of set bits vs unset bits to return.
+    ///
+    /// For example, `mixed_ratio(0.9)` returns 90% existing (set) and 10% new (unset).
+    /// This is useful for "90% overwrite + 10% new write" benchmark patterns.
+    ///
+    /// Note: This overrides `set_only()` / `unset_only()` filters.
+    #[inline]
+    pub fn mixed_ratio(mut self, set_ratio: f64) -> Self {
+        self.sampling = self.sampling.with_set_ratio(set_ratio.clamp(0.0, 1.0));
+        self
+    }
+
+    /// Limit the number of items returned.
+    #[inline]
+    pub fn limit(mut self, n: u64) -> Self {
+        self.sampling = self.sampling.with_limit(n);
+        self
+    }
+
+    /// Set probabilistic sampling: each item has `probability` chance of being returned.
+    ///
+    /// For example, `sample(0.5)` returns approximately 50% of matching items.
+    #[inline]
+    pub fn sample(mut self, probability: f64) -> Self {
+        self.sampling = self.sampling.with_sample_probability(probability.clamp(0.0, 1.0));
+        self
+    }
+
+    /// Set random seed for reproducible iteration.
+    #[inline]
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.sampling = self.sampling.with_seed(seed);
+        self
+    }
+
+    /// Set full sampling config.
+    #[inline]
+    pub fn with_sampling(mut self, config: SamplingConfig) -> Self {
+        self.sampling = config;
+        self
+    }
+
+    /// Set access distribution for random iteration.
+    ///
+    /// Use Zipfian for cache workloads, Exponential for session stores, etc.
+    #[inline]
+    pub fn distribution(mut self, dist: super::config::AccessDistribution) -> Self {
+        self.sampling.distribution = dist;
+        self
+    }
+
+    /// Enable overlapping iteration (contention testing).
+    ///
+    /// Multiple threads may visit the same keys, useful for testing
+    /// concurrent access patterns and lock contention.
+    #[inline]
+    pub fn overlapping(mut self) -> Self {
+        self.sampling.overlapping = true;
+        self
+    }
+
+    /// Set ID range using percentage of the keyspace.
+    ///
+    /// For example, `range_percent(0.5, 1.0)` iterates the upper 50% of keyspace.
+    #[inline]
+    pub fn range_percent(mut self, start_pct: f64, end_pct: f64) -> Self {
+        let max = self.tracker.effective_max_id();
+        let start = (max as f64 * start_pct.clamp(0.0, 1.0)) as u64;
+        let end = (max as f64 * end_pct.clamp(0.0, 1.0)) as u64;
+        self.range.id_min = start;
+        self.range.id_max = end;
+        self
+    }
+
+    /// Check if sampling is configured.
+    #[inline]
+    fn has_sampling(&self) -> bool {
+        self.sampling.has_sampling()
+    }
+
     /// Build a sequential (ascending order) iterator.
     pub fn sequential(self) -> SequentialIter<'a> {
         let max_id = self.range.id_max.min(self.tracker.effective_max_id());
@@ -87,33 +174,42 @@ impl<'a> TrackerIterBuilder<'a> {
             tracker: self.tracker,
             range: self.range,
             filter: self.filter,
+            sampling: self.sampling,
             current_id: self.range.id_min,
             current_sub_id: self.range.sub_id_min,
             max_id,
+            rng: self.sampling.make_rng(),
+            yielded: 0,
         }
     }
 
     /// Build a random-order iterator.
     ///
     /// Uses multiplicative hashing for memory-efficient pseudo-random traversal.
+    /// If sampling is configured, returns a `SamplingIter<RandomIter>` instead.
     pub fn random(self) -> RandomIter<'a> {
         let max_id = self.range.id_max.min(self.tracker.effective_max_id());
-
         let range_size = max_id.saturating_sub(self.range.id_min);
 
         // Choose a multiplier coprime with range_size for full coverage
         let multiplier = Self::find_coprime(range_size);
-        let seed = fastrand::u64(..);
+
+        // Use seeded RNG if configured, otherwise random
+        let mut rng = self.sampling.make_rng();
+        let offset = rng.u64(..) % range_size.max(1);
 
         RandomIter {
             tracker: self.tracker,
             range: self.range,
             filter: self.filter,
+            sampling: self.sampling,
             range_size,
             multiplier,
-            offset: seed % range_size.max(1),
+            offset,
             current_step: 0,
             max_steps: range_size,
+            rng,
+            yielded: 0,
         }
     }
 
@@ -237,16 +333,45 @@ impl<'a> TrackerIterBuilder<'a> {
     /// Build partitioned iterators for parallel processing.
     ///
     /// Returns `n` iterators with disjoint ranges covering the full space.
+    /// Each partition gets its own RNG seeded from the base seed + partition index.
     pub fn partitioned(self, n: usize) -> Vec<PartitionedIter<'a>> {
         let max_id = self.range.id_max.min(self.tracker.effective_max_id());
-
         let total = max_id.saturating_sub(self.range.id_min);
-        let chunk_size = (total + n as u64 - 1) / n as u64;
+        
+        // In overlapping mode, each partition iterates the full range
+        let overlapping = self.sampling.overlapping;
+        let chunk_size = if overlapping {
+            total // Each partition gets full range
+        } else {
+            (total + n as u64 - 1) / n as u64
+        };
+
+        // Per-partition limit if overall limit is set
+        let per_partition_limit = if overlapping {
+            self.sampling.limit // Each partition gets full limit in overlapping mode
+        } else {
+            self.sampling.limit.map(|l| (l + n as u64 - 1) / n as u64)
+        };
 
         (0..n)
             .map(|i| {
-                let start = self.range.id_min + i as u64 * chunk_size;
-                let end = (start + chunk_size).min(max_id);
+                let (start, end) = if overlapping {
+                    // All partitions get the full range
+                    (self.range.id_min, max_id)
+                } else {
+                    // Non-overlapping: divide range among partitions
+                    let start = self.range.id_min + i as u64 * chunk_size;
+                    let end = (start + chunk_size).min(max_id);
+                    (start, end)
+                };
+
+                // Create per-partition sampling config with adjusted limit and seed
+                let mut partition_sampling = self.sampling;
+                partition_sampling.limit = per_partition_limit;
+                // Seed each partition differently for better randomness
+                if let Some(seed) = self.sampling.seed {
+                    partition_sampling.seed = Some(seed.wrapping_add(i as u64));
+                }
 
                 PartitionedIter {
                     tracker: self.tracker,
@@ -257,8 +382,11 @@ impl<'a> TrackerIterBuilder<'a> {
                         sub_id_max: self.range.sub_id_max,
                     },
                     filter: self.filter,
+                    sampling: partition_sampling,
                     current_id: start,
                     current_sub_id: self.range.sub_id_min,
+                    rng: partition_sampling.make_rng(),
+                    yielded: 0,
                 }
             })
             .collect()
@@ -272,18 +400,62 @@ impl<'a> TrackerIterBuilder<'a> {
 /// Sequential iterator over IDs in ascending order.
 ///
 /// Thread-safe: multiple instances can run concurrently for reads.
+/// Supports sampling configuration for mixed-ratio, probabilistic sampling, and limits.
 pub struct SequentialIter<'a> {
     tracker: &'a PrefixTracker,
     range: IdRange,
     filter: BitFilter,
+    sampling: SamplingConfig,
     current_id: u64,
     current_sub_id: u64,
     max_id: u64,
+    rng: fastrand::Rng,
+    yielded: u64,
 }
 
 impl<'a> SequentialIter<'a> {
+    /// Check if we should continue iterating (respects limit).
+    #[inline]
+    fn check_limit(&self) -> bool {
+        if let Some(limit) = self.sampling.limit {
+            self.yielded < limit
+        } else {
+            true
+        }
+    }
+
+    /// Check if item matches filter (with mixed-ratio support).
+    #[inline]
+    fn matches_filter(&mut self, is_set: bool) -> bool {
+        if let Some(set_ratio) = self.sampling.set_ratio {
+            // Mixed-ratio mode
+            let want_set = self.rng.f64() < set_ratio;
+            want_set == is_set
+        } else {
+            match self.filter {
+                BitFilter::All => true,
+                BitFilter::Set => is_set,
+                BitFilter::Unset => !is_set,
+            }
+        }
+    }
+
+    /// Check probabilistic sampling.
+    #[inline]
+    fn passes_sampling(&mut self) -> bool {
+        if self.sampling.sample_probability < 1.0 {
+            self.rng.f64() < self.sampling.sample_probability
+        } else {
+            true
+        }
+    }
+
     /// Get next ID for simple (non-hierarchical) trackers.
     fn next_simple(&mut self) -> Option<TrackerItem> {
+        if !self.check_limit() {
+            return None;
+        }
+
         let bitmap = self.tracker.primary_bitmap();
 
         while self.current_id < self.max_id {
@@ -292,15 +464,16 @@ impl<'a> SequentialIter<'a> {
 
             let is_set = bitmap.test(id as usize);
 
-            let matches = match self.filter {
-                BitFilter::All => true,
-                BitFilter::Set => is_set,
-                BitFilter::Unset => !is_set,
-            };
-
-            if matches {
-                return Some((id, None));
+            if !self.matches_filter(is_set) {
+                continue;
             }
+
+            if !self.passes_sampling() {
+                continue;
+            }
+
+            self.yielded += 1;
+            return Some((id, None));
         }
 
         None
@@ -308,6 +481,10 @@ impl<'a> SequentialIter<'a> {
 
     /// Get next (id, sub_id) for hierarchical trackers.
     fn next_hierarchical(&mut self) -> Option<TrackerItem> {
+        if !self.check_limit() {
+            return None;
+        }
+
         let sub_bitmaps = self.tracker.sub_bitmaps()?;
 
         loop {
@@ -336,15 +513,21 @@ impl<'a> SequentialIter<'a> {
 
                     let is_set = sub_bitmap.test(sub_id as usize);
 
-                    let matches = match self.filter {
-                        BitFilter::All => true,
-                        BitFilter::Set => is_set,
-                        BitFilter::Unset => !is_set,
-                    };
-
-                    if matches {
-                        return Some((self.current_id, Some(sub_id)));
+                    if !self.matches_filter(is_set) {
+                        continue;
                     }
+
+                    if !self.passes_sampling() {
+                        continue;
+                    }
+
+                    // Re-check limit after potential skip
+                    if !self.check_limit() {
+                        return None;
+                    }
+
+                    self.yielded += 1;
+                    return Some((self.current_id, Some(sub_id)));
                 }
             }
 
@@ -374,33 +557,51 @@ impl Iterator for SequentialIter<'_> {
 /// Random-order iterator over IDs.
 ///
 /// Uses multiplicative hashing for memory-efficient pseudo-random traversal
-/// without storing all indices.
+/// without storing all indices. Supports sampling configuration for:
+/// - Mixed-ratio iteration (X% set, Y% unset)
+/// - Probabilistic sampling
+/// - Limit on returned items
 pub struct RandomIter<'a> {
     tracker: &'a PrefixTracker,
     range: IdRange,
     filter: BitFilter,
+    sampling: SamplingConfig,
     range_size: u64,
     multiplier: u64,
     offset: u64,
     current_step: u64,
     max_steps: u64,
+    rng: fastrand::Rng,
+    yielded: u64,
 }
 
 impl<'a> RandomIter<'a> {
     fn next_index(&mut self) -> Option<u64> {
-        while self.current_step < self.max_steps {
-            // Multiplicative permutation: index = (step * multiplier + offset) % range_size
-            let index = if self.range_size > 0 {
-                (self
-                    .current_step
-                    .wrapping_mul(self.multiplier)
-                    .wrapping_add(self.offset))
-                    % self.range_size
-            } else {
+        // Check limit
+        if let Some(limit) = self.sampling.limit {
+            if self.yielded >= limit {
                 return None;
-            };
+            }
+        }
 
+        while self.current_step < self.max_steps {
             self.current_step += 1;
+
+            // Select index based on distribution
+            let index = if self.sampling.has_distribution() {
+                // Use configured distribution (Zipfian, Exponential, etc.)
+                self.sampling.sample_index(&mut self.rng, self.range_size)
+            } else {
+                // Use multiplicative permutation for uniform coverage
+                if self.range_size > 0 {
+                    ((self.current_step - 1)
+                        .wrapping_mul(self.multiplier)
+                        .wrapping_add(self.offset))
+                        % self.range_size
+                } else {
+                    return None;
+                }
+            };
 
             let id = self.range.id_min + index;
 
@@ -410,15 +611,33 @@ impl<'a> RandomIter<'a> {
 
             let is_set = self.tracker.primary_bitmap().test(id as usize);
 
-            let matches = match self.filter {
-                BitFilter::All => true,
-                BitFilter::Set => is_set,
-                BitFilter::Unset => !is_set,
+            // Apply filter logic (with mixed-ratio support)
+            let matches = if let Some(set_ratio) = self.sampling.set_ratio {
+                // Mixed-ratio mode: probabilistically select set vs unset
+                let want_set = self.rng.f64() < set_ratio;
+                want_set == is_set
+            } else {
+                // Standard filter mode
+                match self.filter {
+                    BitFilter::All => true,
+                    BitFilter::Set => is_set,
+                    BitFilter::Unset => !is_set,
+                }
             };
 
-            if matches {
-                return Some(id);
+            if !matches {
+                continue;
             }
+
+            // Apply probabilistic sampling
+            if self.sampling.sample_probability < 1.0 {
+                if self.rng.f64() >= self.sampling.sample_probability {
+                    continue;
+                }
+            }
+
+            self.yielded += 1;
+            return Some(id);
         }
 
         None
@@ -687,12 +906,16 @@ impl Drop for DeleteIter<'_> {
 // ============================================================================
 
 /// Partitioned iterator for parallel processing with guaranteed disjoint ranges.
+/// Supports sampling configuration for mixed-ratio, probabilistic sampling, and limits.
 pub struct PartitionedIter<'a> {
     tracker: &'a PrefixTracker,
     range: IdRange,
     filter: BitFilter,
+    sampling: SamplingConfig,
     current_id: u64,
     current_sub_id: u64,
+    rng: fastrand::Rng,
+    yielded: u64,
 }
 
 impl<'a> PartitionedIter<'a> {
@@ -715,7 +938,46 @@ impl Iterator for PartitionedIter<'_> {
 }
 
 impl<'a> PartitionedIter<'a> {
+    /// Check if we should continue iterating (respects limit).
+    #[inline]
+    fn check_limit(&self) -> bool {
+        if let Some(limit) = self.sampling.limit {
+            self.yielded < limit
+        } else {
+            true
+        }
+    }
+
+    /// Check if item matches filter (with mixed-ratio support).
+    #[inline]
+    fn matches_filter(&mut self, is_set: bool) -> bool {
+        if let Some(set_ratio) = self.sampling.set_ratio {
+            let want_set = self.rng.f64() < set_ratio;
+            want_set == is_set
+        } else {
+            match self.filter {
+                BitFilter::All => true,
+                BitFilter::Set => is_set,
+                BitFilter::Unset => !is_set,
+            }
+        }
+    }
+
+    /// Check probabilistic sampling.
+    #[inline]
+    fn passes_sampling(&mut self) -> bool {
+        if self.sampling.sample_probability < 1.0 {
+            self.rng.f64() < self.sampling.sample_probability
+        } else {
+            true
+        }
+    }
+
     fn next_simple(&mut self) -> Option<TrackerItem> {
+        if !self.check_limit() {
+            return None;
+        }
+
         let bitmap = self.tracker.primary_bitmap();
 
         while self.current_id < self.range.id_max {
@@ -724,21 +986,26 @@ impl<'a> PartitionedIter<'a> {
 
             let is_set = bitmap.test(id as usize);
 
-            let matches = match self.filter {
-                BitFilter::All => true,
-                BitFilter::Set => is_set,
-                BitFilter::Unset => !is_set,
-            };
-
-            if matches {
-                return Some((id, None));
+            if !self.matches_filter(is_set) {
+                continue;
             }
+
+            if !self.passes_sampling() {
+                continue;
+            }
+
+            self.yielded += 1;
+            return Some((id, None));
         }
 
         None
     }
 
     fn next_hierarchical(&mut self) -> Option<TrackerItem> {
+        if !self.check_limit() {
+            return None;
+        }
+
         let sub_bitmaps = self.tracker.sub_bitmaps()?;
 
         while self.current_id < self.range.id_max {
@@ -761,15 +1028,20 @@ impl<'a> PartitionedIter<'a> {
 
                     let is_set = sub_bitmap.test(sub_id as usize);
 
-                    let matches = match self.filter {
-                        BitFilter::All => true,
-                        BitFilter::Set => is_set,
-                        BitFilter::Unset => !is_set,
-                    };
-
-                    if matches {
-                        return Some((self.current_id, Some(sub_id)));
+                    if !self.matches_filter(is_set) {
+                        continue;
                     }
+
+                    if !self.passes_sampling() {
+                        continue;
+                    }
+
+                    if !self.check_limit() {
+                        return None;
+                    }
+
+                    self.yielded += 1;
+                    return Some((self.current_id, Some(sub_id)));
                 }
             }
 
@@ -785,6 +1057,221 @@ impl<'a> PartitionedIter<'a> {
 mod tests {
     use super::*;
     use crate::TrackerConfig;
+
+    // ========================================================================
+    // Sampling Tests
+    // ========================================================================
+
+    #[test]
+    fn test_limit_sequential() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(100));
+        for i in 0..100 {
+            tracker.add(i);
+        }
+
+        let items: Vec<_> = tracker.iter().set_only().limit(10).sequential().collect();
+        assert_eq!(items.len(), 10);
+    }
+
+    #[test]
+    fn test_limit_random() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(100));
+        for i in 0..100 {
+            tracker.add(i);
+        }
+
+        let items: Vec<_> = tracker.iter().set_only().limit(10).random().collect();
+        assert_eq!(items.len(), 10);
+    }
+
+    #[test]
+    fn test_sample_probability() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(1000));
+        for i in 0..1000 {
+            tracker.add(i);
+        }
+
+        // Sample ~50% - should get roughly 400-600 items
+        let items: Vec<_> = tracker
+            .iter()
+            .set_only()
+            .sample(0.5)
+            .seed(12345) // Reproducible
+            .sequential()
+            .collect();
+
+        assert!(items.len() > 300 && items.len() < 700);
+    }
+
+    #[test]
+    fn test_seeded_random_reproducible() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(100));
+        for i in 0..100 {
+            tracker.add(i);
+        }
+
+        // Same seed should produce same sequence
+        let items1: Vec<_> = tracker
+            .iter()
+            .set_only()
+            .seed(42)
+            .random()
+            .take(20)
+            .collect();
+
+        let items2: Vec<_> = tracker
+            .iter()
+            .set_only()
+            .seed(42)
+            .random()
+            .take(20)
+            .collect();
+
+        assert_eq!(items1, items2);
+    }
+
+    #[test]
+    fn test_mixed_ratio() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(100));
+        // Set half the bits
+        for i in 0..50 {
+            tracker.add(i);
+        }
+
+        // 80% set, 20% unset
+        let items: Vec<_> = tracker
+            .iter()
+            .mixed_ratio(0.8)
+            .seed(12345)
+            .limit(100)
+            .random()
+            .collect();
+
+        let set_count = items.iter().filter(|(id, _)| tracker.exists(*id)).count();
+        let unset_count = items.len() - set_count;
+
+        // Should have more set than unset (roughly 80/20)
+        assert!(set_count > unset_count * 2);
+    }
+
+    #[test]
+    fn test_range_percent() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(100));
+        for i in 0..100 {
+            tracker.add(i);
+        }
+
+        // Upper 50%
+        let items: Vec<_> = tracker
+            .iter()
+            .set_only()
+            .range_percent(0.5, 1.0)
+            .sequential()
+            .collect();
+
+        assert!(items.iter().all(|(id, _)| *id >= 50));
+        assert_eq!(items.len(), 50);
+    }
+
+    #[test]
+    fn test_partitioned_with_sampling() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(1000));
+        for i in 0..1000 {
+            tracker.add(i);
+        }
+
+        // Each partition should get ~25 items (100 total / 4 partitions)
+        let partitions = tracker.iter().set_only().limit(100).partitioned(4);
+
+        let total: usize = partitions.into_iter().map(|p| p.count()).sum();
+        // Total should be close to 100 (may vary slightly due to partitioning)
+        assert!(total >= 96 && total <= 104);
+    }
+
+    // ========================================================================
+    // Workload & Distribution Tests
+    // ========================================================================
+
+    #[test]
+    fn test_zipfian_distribution() {
+        use crate::AccessDistribution;
+
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(10000));
+        for i in 0..10000 {
+            tracker.add(i);
+        }
+
+        // Zipfian should heavily favor low-index keys
+        let items: Vec<_> = tracker
+            .iter()
+            .set_only()
+            .distribution(AccessDistribution::Zipfian { skew: 1.0 })
+            .seed(42)
+            .limit(1000)
+            .random()
+            .collect();
+
+        assert_eq!(items.len(), 1000);
+
+        // Count how many are in first 10% of keyspace
+        let low_count = items.iter().filter(|(id, _)| *id < 1000).count();
+        // Should be more than 50% (Zipfian is heavily skewed)
+        assert!(low_count > 500, "Zipfian should favor low indices, got {} in first 10%", low_count);
+    }
+
+    #[test]
+    fn test_hotspot_distribution() {
+        use crate::AccessDistribution;
+
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(10000));
+        for i in 0..10000 {
+            tracker.add(i);
+        }
+
+        // 10% hot keys should get 90% of accesses
+        let items: Vec<_> = tracker
+            .iter()
+            .set_only()
+            .distribution(AccessDistribution::Hotspot { hot_pct: 0.1, hot_prob: 0.9 })
+            .seed(42)
+            .limit(1000)
+            .random()
+            .collect();
+
+        let hot_count = items.iter().filter(|(id, _)| *id < 1000).count();
+        // Should be around 90%
+        assert!(hot_count > 800, "Hotspot should strongly favor hot keys, got {} hot", hot_count);
+    }
+
+    #[test]
+    fn test_overlapping_mode() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(100));
+        for i in 0..100 {
+            tracker.add(i);
+        }
+
+        // With overlapping, multiple partitions can see same keys
+        let partitions = tracker
+            .iter()
+            .set_only()
+            .overlapping()
+            .seed(42)
+            .partitioned(4);
+
+        let mut all_items: Vec<u64> = Vec::new();
+        for partition in partitions {
+            for (id, _) in partition {
+                all_items.push(id);
+            }
+        }
+
+        // All 100 items should be visited by each partition
+        assert_eq!(all_items.len(), 400);
+    }
+
+    // ========================================================================
+    // Original Tests
+    // ========================================================================
 
     #[test]
     fn test_sequential_iter_simple() {

@@ -580,6 +580,261 @@ impl PrefixTracker {
     pub(crate) fn effective_max_sub_id(&self) -> u64 {
         self.config.max_sub_id.unwrap_or(u64::MAX)
     }
+
+    // ========================================================================
+    // Snapshot & Diff Operations
+    // ========================================================================
+
+    /// Take immutable snapshot of current state.
+    ///
+    /// Useful for tracking changes across workloads.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use keyspace_tracker::{PrefixTracker, TrackerConfig};
+    ///
+    /// let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(1000));
+    /// tracker.add_range(0, 500);
+    ///
+    /// let before = tracker.snapshot();
+    /// tracker.add_range(500, 1000);
+    /// tracker.remove_range(0, 100);
+    ///
+    /// let added = tracker.added_since(&before);
+    /// let removed = tracker.removed_since(&before);
+    /// ```
+    pub fn snapshot(&self) -> super::config::BitmapSnapshot {
+        self.primary_bitmap.snapshot()
+    }
+
+    /// Get IDs added since snapshot (in current but not in snapshot).
+    pub fn added_since(&self, snapshot: &super::config::BitmapSnapshot) -> Vec<u64> {
+        self.snapshot().difference(snapshot)
+    }
+
+    /// Get IDs removed since snapshot (in snapshot but not in current).
+    pub fn removed_since(&self, snapshot: &super::config::BitmapSnapshot) -> Vec<u64> {
+        snapshot.difference(&self.snapshot())
+    }
+
+    /// Count IDs added since snapshot.
+    #[inline]
+    pub fn added_count_since(&self, snapshot: &super::config::BitmapSnapshot) -> u64 {
+        self.snapshot().difference_count(snapshot)
+    }
+
+    /// Count IDs removed since snapshot.
+    #[inline]
+    pub fn removed_count_since(&self, snapshot: &super::config::BitmapSnapshot) -> u64 {
+        snapshot.difference_count(&self.snapshot())
+    }
+
+    /// Restore IDs from a reference set that are currently missing.
+    ///
+    /// Returns the number of IDs restored.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use keyspace_tracker::{PrefixTracker, TrackerConfig, ReferenceSet};
+    ///
+    /// let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(1000));
+    /// tracker.add_range(0, 1000);
+    /// tracker.remove_range(100, 200);  // Delete some
+    ///
+    /// // Application has a set of important IDs that must exist
+    /// let important = ReferenceSet::from_iter(50..250);
+    ///
+    /// // Restore missing important IDs
+    /// let restored = tracker.restore_from_reference(&important);
+    /// assert_eq!(restored, 100);  // IDs 100-199 were restored
+    /// ```
+    pub fn restore_from_reference(&self, reference: &super::config::ReferenceSet) -> u64 {
+        let snapshot = self.snapshot();
+        let missing = reference.missing_in(&snapshot);
+        let mut restored = 0u64;
+
+        for id in missing {
+            if self.primary_bitmap.test_and_set(id as usize) {
+                restored += 1;
+            }
+        }
+        restored
+    }
+
+    /// Iterate only IDs that exist in both tracker and reference set.
+    ///
+    /// Efficient intersection iteration without materializing the full list.
+    pub fn iter_intersection<'a>(
+        &'a self,
+        reference: &'a super::config::ReferenceSet,
+    ) -> impl Iterator<Item = u64> + 'a {
+        reference.iter().filter(|&id| self.exists(id))
+    }
+
+    /// Iterate IDs from reference set that are missing in tracker.
+    pub fn iter_missing_from_reference<'a>(
+        &'a self,
+        reference: &'a super::config::ReferenceSet,
+    ) -> impl Iterator<Item = u64> + 'a {
+        reference.iter().filter(|&id| !self.exists(id))
+    }
+
+    // ========================================================================
+    // Bulk Operations & Workload Utilities
+    // ========================================================================
+
+    /// Add all IDs in range [start, end).
+    ///
+    /// Returns the number of IDs newly added.
+    /// More efficient than calling add() in a loop.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use keyspace_tracker::PrefixTracker;
+    ///
+    /// let tracker = PrefixTracker::simple("vec:");
+    /// let added = tracker.add_range(0, 1000);
+    /// assert_eq!(added, 1000);
+    /// assert_eq!(tracker.count(), 1000);
+    /// ```
+    pub fn add_range(&self, start: u64, end: u64) -> u64 {
+        debug_assert!(!self.is_hierarchical(), "use add_pair() for hierarchical trackers");
+
+        let effective_end = match self.config.max_id {
+            Some(max) => end.min(max),
+            None => end,
+        };
+
+        if start >= effective_end {
+            return 0;
+        }
+
+        self.primary_bitmap.set_range(start as usize, effective_end as usize)
+    }
+
+    /// Remove all IDs in range [start, end).
+    ///
+    /// Returns the number of IDs removed.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use keyspace_tracker::PrefixTracker;
+    ///
+    /// let tracker = PrefixTracker::simple("vec:");
+    /// tracker.add_range(0, 1000);
+    /// let removed = tracker.remove_range(0, 500);
+    /// assert_eq!(removed, 500);
+    /// assert_eq!(tracker.count(), 500);
+    /// ```
+    pub fn remove_range(&self, start: u64, end: u64) -> u64 {
+        debug_assert!(!self.is_hierarchical(), "use remove_pair() for hierarchical trackers");
+        self.primary_bitmap.clear_range(start as usize, end as usize)
+    }
+
+    /// Populate tracker with a fragmentation pattern.
+    ///
+    /// Useful for creating realistic test scenarios, especially for
+    /// defragmentation testing.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use keyspace_tracker::{PrefixTracker, TrackerConfig, FragmentationPattern};
+    ///
+    /// let tracker = PrefixTracker::new(
+    ///     TrackerConfig::simple("vec:").with_max_id(10000)
+    /// );
+    ///
+    /// // Create 70% filled with random holes
+    /// tracker.populate_with_pattern(
+    ///     FragmentationPattern::Sparse { density: 0.7 },
+    ///     Some(42) // reproducible seed
+    /// );
+    ///
+    /// // Create alternating pattern (every other key)
+    /// tracker.populate_with_pattern(
+    ///     FragmentationPattern::Alternating { stride: 2 },
+    ///     None
+    /// );
+    /// ```
+    pub fn populate_with_pattern(
+        &self,
+        pattern: super::config::FragmentationPattern,
+        seed: Option<u64>,
+    ) -> u64 {
+        debug_assert!(!self.is_hierarchical(), "not supported for hierarchical trackers");
+
+        let max_id = self.effective_max_id();
+        let mut rng = match seed {
+            Some(s) => fastrand::Rng::with_seed(s),
+            None => fastrand::Rng::new(),
+        };
+
+        let mut added = 0u64;
+
+        for id in 0..max_id {
+            if pattern.should_exist(id, max_id, &mut rng) {
+                if self.primary_bitmap.test_and_set(id as usize) {
+                    added += 1;
+                }
+            }
+        }
+
+        added
+    }
+
+    /// Populate tracker based on a workload profile.
+    ///
+    /// Applies the profile's fragmentation pattern and returns
+    /// an RNG configured for the profile's access distribution.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use keyspace_tracker::{PrefixTracker, TrackerConfig, WorkloadProfile};
+    ///
+    /// let tracker = PrefixTracker::new(
+    ///     TrackerConfig::simple("cache:").with_max_id(100000)
+    /// );
+    ///
+    /// let profile = WorkloadProfile::cache(0.9);
+    /// let rng = tracker.populate_with_profile(&profile);
+    ///
+    /// // Use rng for workload-distributed access
+    /// let key_id = profile.distribution.sample(&rng, tracker.effective_max_id());
+    /// ```
+    pub fn populate_with_profile(
+        &self,
+        profile: &super::config::WorkloadProfile,
+    ) -> fastrand::Rng {
+        debug_assert!(!self.is_hierarchical(), "not supported for hierarchical trackers");
+
+        let mut rng = match profile.seed {
+            Some(s) => fastrand::Rng::with_seed(s),
+            None => fastrand::Rng::new(),
+        };
+
+        // First, fill completely
+        let max_id = self.effective_max_id();
+        self.primary_bitmap.set_range(0, max_id as usize);
+
+        // Then apply fragmentation pattern
+        if !matches!(profile.fragmentation, super::config::FragmentationPattern::None) {
+            for id in 0..max_id {
+                if !profile.fragmentation.should_exist(id, max_id, &mut rng) {
+                    self.primary_bitmap.clear(id as usize);
+                }
+            }
+            // Recompute count since we modified directly
+            self.primary_bitmap.verify_count();
+        }
+
+        rng
+    }
 }
 
 impl std::fmt::Debug for PrefixTracker {

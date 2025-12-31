@@ -198,7 +198,9 @@ pub use bitmap::ArmCapabilities;
 pub use bitmap::X86Capabilities;
 pub use bitmap::print_cpu_capabilities;
 pub use config::{
-    BitFilter, ClaimPolicy, IdRange, IterOrder, PrefixFilter, PrefixWeight, TrackerConfig,
+    AccessDistribution, BitmapSnapshot, BitFilter, ClaimPolicy, FragmentationPattern, IdRange,
+    IterOrder, PrefixFilter, PrefixWeight, ReferenceSet, SamplingConfig, TrackerConfig,
+    WorkloadOperation, WorkloadProfile,
 };
 pub use group_iter::{
     GroupDeleteIter, GroupItem, GroupIter, GroupIterBuilder, GroupPartitionedIter, GroupWriteIter,

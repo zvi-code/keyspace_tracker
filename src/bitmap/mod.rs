@@ -664,6 +664,263 @@ impl AtomicBitmap {
             self.count() as f64 / cap
         }
     }
+
+    // ========================================================================
+    // Bulk Operations
+    // ========================================================================
+
+    /// Set all bits in range [start, end).
+    ///
+    /// This is more efficient than calling `set()` in a loop for bulk initialization.
+    /// Auto-grows if end > capacity.
+    ///
+    /// Returns the number of bits that were newly set (were previously unset).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use keyspace_tracker::AtomicBitmap;
+    ///
+    /// let bitmap = AtomicBitmap::with_capacity(1000);
+    /// let newly_set = bitmap.set_range(0, 100);
+    /// assert_eq!(newly_set, 100);
+    /// assert_eq!(bitmap.count(), 100);
+    /// ```
+    pub fn set_range(&self, start: usize, end: usize) -> u64 {
+        if start >= end {
+            return 0;
+        }
+
+        // Ensure capacity for the entire range
+        if end > 0 {
+            self.ensure_capacity(end - 1);
+        }
+
+        let start_word = start >> WORD_SHIFT;
+        let end_word = (end + BITS_PER_WORD - 1) >> WORD_SHIFT;
+        let words = self.words();
+        let mut newly_set = 0u64;
+
+        // Handle first partial word
+        let start_bit = start & WORD_MASK;
+        if start_bit != 0 {
+            let mask = u64::MAX << start_bit;
+            // If start and end are in same word, also mask the upper bits
+            let mask = if start_word == end_word - 1 {
+                let end_bit = end & WORD_MASK;
+                let end_mask = if end_bit == 0 { u64::MAX } else { (1u64 << end_bit) - 1 };
+                mask & end_mask
+            } else {
+                mask
+            };
+
+            if start_word < words.len() {
+                let old = words[start_word].fetch_or(mask, Ordering::AcqRel);
+                newly_set += (mask & !old).count_ones() as u64;
+            }
+
+            // If fully handled in first word, we're done
+            if start_word == end_word - 1 {
+                self.popcount.fetch_add(newly_set, Ordering::Relaxed);
+                return newly_set;
+            }
+        }
+
+        // Handle full words in the middle
+        let first_full_word = if start_bit != 0 { start_word + 1 } else { start_word };
+        let last_full_word = if (end & WORD_MASK) != 0 { end_word - 1 } else { end_word };
+
+        for word_idx in first_full_word..last_full_word.min(words.len()) {
+            let old = words[word_idx].fetch_or(u64::MAX, Ordering::AcqRel);
+            newly_set += (!old).count_ones() as u64;
+        }
+
+        // Handle last partial word
+        let end_bit = end & WORD_MASK;
+        if end_bit != 0 && last_full_word < end_word && last_full_word < words.len() {
+            let mask = (1u64 << end_bit) - 1;
+            let old = words[last_full_word].fetch_or(mask, Ordering::AcqRel);
+            newly_set += (mask & !old).count_ones() as u64;
+        }
+
+        self.popcount.fetch_add(newly_set, Ordering::Relaxed);
+        newly_set
+    }
+
+    /// Clear all bits in range [start, end).
+    ///
+    /// This is more efficient than calling `clear()` in a loop.
+    /// No-op for bits beyond capacity.
+    ///
+    /// Returns the number of bits that were cleared (were previously set).
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use keyspace_tracker::AtomicBitmap;
+    ///
+    /// let bitmap = AtomicBitmap::with_capacity(1000);
+    /// bitmap.set_range(0, 100);
+    /// let cleared = bitmap.clear_range(25, 75);
+    /// assert_eq!(cleared, 50);
+    /// assert_eq!(bitmap.count(), 50);
+    /// ```
+    pub fn clear_range(&self, start: usize, end: usize) -> u64 {
+        if start >= end {
+            return 0;
+        }
+
+        let capacity = self.capacity();
+        let end = end.min(capacity);
+        if start >= end {
+            return 0;
+        }
+
+        let start_word = start >> WORD_SHIFT;
+        let end_word = (end + BITS_PER_WORD - 1) >> WORD_SHIFT;
+        let words = self.words();
+        let mut cleared = 0u64;
+
+        // Handle first partial word
+        let start_bit = start & WORD_MASK;
+        if start_bit != 0 {
+            let mask = u64::MAX << start_bit;
+            let mask = if start_word == end_word - 1 {
+                let end_bit = end & WORD_MASK;
+                let end_mask = if end_bit == 0 { u64::MAX } else { (1u64 << end_bit) - 1 };
+                mask & end_mask
+            } else {
+                mask
+            };
+
+            if start_word < words.len() {
+                let old = words[start_word].fetch_and(!mask, Ordering::AcqRel);
+                cleared += (mask & old).count_ones() as u64;
+            }
+
+            if start_word == end_word - 1 {
+                self.popcount.fetch_sub(cleared, Ordering::Relaxed);
+                return cleared;
+            }
+        }
+
+        // Handle full words
+        let first_full_word = if start_bit != 0 { start_word + 1 } else { start_word };
+        let last_full_word = if (end & WORD_MASK) != 0 { end_word - 1 } else { end_word };
+
+        for word_idx in first_full_word..last_full_word.min(words.len()) {
+            let old = words[word_idx].swap(0, Ordering::AcqRel);
+            cleared += old.count_ones() as u64;
+        }
+
+        // Handle last partial word
+        let end_bit = end & WORD_MASK;
+        if end_bit != 0 && last_full_word < end_word && last_full_word < words.len() {
+            let mask = (1u64 << end_bit) - 1;
+            let old = words[last_full_word].fetch_and(!mask, Ordering::AcqRel);
+            cleared += (mask & old).count_ones() as u64;
+        }
+
+        self.popcount.fetch_sub(cleared, Ordering::Relaxed);
+        cleared
+    }
+
+    /// Count set bits in range [start, end) without modifying.
+    ///
+    /// More efficient than iterating for large ranges.
+    pub fn count_range(&self, start: usize, end: usize) -> u64 {
+        if start >= end {
+            return 0;
+        }
+
+        let capacity = self.capacity();
+        let end = end.min(capacity);
+        if start >= end {
+            return 0;
+        }
+
+        let start_word = start >> WORD_SHIFT;
+        let end_word = (end + BITS_PER_WORD - 1) >> WORD_SHIFT;
+        let words = self.words();
+        let mut count = 0u64;
+
+        // Handle first partial word
+        let start_bit = start & WORD_MASK;
+        if start_bit != 0 {
+            let mask = u64::MAX << start_bit;
+            let mask = if start_word == end_word - 1 {
+                let end_bit = end & WORD_MASK;
+                let end_mask = if end_bit == 0 { u64::MAX } else { (1u64 << end_bit) - 1 };
+                mask & end_mask
+            } else {
+                mask
+            };
+
+            if start_word < words.len() {
+                count += (words[start_word].load(Ordering::Relaxed) & mask).count_ones() as u64;
+            }
+
+            if start_word == end_word - 1 {
+                return count;
+            }
+        }
+
+        // Handle full words (use SIMD for large ranges)
+        let first_full_word = if start_bit != 0 { start_word + 1 } else { start_word };
+        let last_full_word = if (end & WORD_MASK) != 0 { end_word - 1 } else { end_word };
+
+        if last_full_word > first_full_word {
+            let full_range = &words[first_full_word..last_full_word.min(words.len())];
+            count += simd_popcount_slice(full_range);
+        }
+
+        // Handle last partial word
+        let end_bit = end & WORD_MASK;
+        if end_bit != 0 && last_full_word < end_word && last_full_word < words.len() {
+            let mask = (1u64 << end_bit) - 1;
+            count += (words[last_full_word].load(Ordering::Relaxed) & mask).count_ones() as u64;
+        }
+
+        count
+    }
+
+    // ========================================================================
+    // Snapshot
+    // ========================================================================
+
+    /// Create an immutable snapshot of current bitmap state.
+    ///
+    /// The snapshot is a non-atomic copy suitable for:
+    /// - State comparison before/after operations
+    /// - Set operations with external reference sets
+    /// - Detecting added/removed IDs
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use keyspace_tracker::AtomicBitmap;
+    ///
+    /// let bitmap = AtomicBitmap::with_capacity(1000);
+    /// bitmap.set_range(0, 500);
+    ///
+    /// let snapshot = bitmap.snapshot();
+    /// bitmap.clear_range(100, 200);
+    ///
+    /// // Use snapshot for comparison
+    /// assert_eq!(snapshot.count(), 500);
+    /// assert!(snapshot.test(150));  // Was set in snapshot
+    /// assert!(!bitmap.test(150));   // Now cleared
+    /// ```
+    pub fn snapshot(&self) -> crate::config::BitmapSnapshot {
+        let words = self.words();
+        let data: Vec<u64> = words.iter()
+            .map(|w| w.load(Ordering::Relaxed))
+            .collect();
+        let capacity = self.capacity();
+        let count = self.count();
+
+        crate::config::BitmapSnapshot::from_raw(data, capacity, count)
+    }
 }
 
 impl Default for AtomicBitmap {

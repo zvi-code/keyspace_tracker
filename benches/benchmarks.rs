@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
 use keyspace_tracker::{
-    AtomicBitmap, PrefixTracker, PrefixGroupsTracker, TrackerConfig, ClaimPolicy,
+    AtomicBitmap, PrefixTracker, PrefixGroupsTracker, TrackerConfig, ClaimPolicy, SamplingConfig,
 };
 use std::sync::Arc;
 
@@ -599,6 +599,498 @@ criterion_group!(
 );
 
 // =============================================================================
+// Sampling & New Iterator Benchmarks
+// =============================================================================
+
+/// Benchmark limit-based iteration (per-key cost)
+fn bench_iter_limit(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sampling/limit");
+    
+    for size in [10_000u64, 100_000, 1_000_000] {
+        let tracker = PrefixTracker::new(
+            TrackerConfig::simple("vec:").with_max_id(size)
+        );
+        for i in 0..size {
+            tracker.add(i);
+        }
+        
+        // Benchmark: iterate with limit (take first N)
+        let limit = 1000u64;
+        group.throughput(Throughput::Elements(limit));
+        
+        group.bench_with_input(BenchmarkId::new("sequential", size), &size, |b, _| {
+            b.iter(|| {
+                let count = tracker.iter()
+                    .set_only()
+                    .limit(limit)
+                    .sequential()
+                    .count();
+                black_box(count)
+            })
+        });
+        
+        group.bench_with_input(BenchmarkId::new("random", size), &size, |b, _| {
+            b.iter(|| {
+                let count = tracker.iter()
+                    .set_only()
+                    .limit(limit)
+                    .random()
+                    .count();
+                black_box(count)
+            })
+        });
+    }
+    
+    group.finish();
+}
+
+/// Benchmark probabilistic sampling (per-key cost)
+fn bench_iter_sample_probability(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sampling/probability");
+    
+    let size = 100_000u64;
+    let tracker = PrefixTracker::new(
+        TrackerConfig::simple("vec:").with_max_id(size)
+    );
+    for i in 0..size {
+        tracker.add(i);
+    }
+    
+    for probability in [0.1, 0.5, 0.9] {
+        let expected = (size as f64 * probability) as u64;
+        group.throughput(Throughput::Elements(expected));
+        
+        group.bench_with_input(
+            BenchmarkId::new("sequential", format!("{:.0}%", probability * 100.0)),
+            &probability,
+            |b, &prob| {
+                b.iter(|| {
+                    let count = tracker.iter()
+                        .set_only()
+                        .sample(prob)
+                        .seed(42)
+                        .sequential()
+                        .count();
+                    black_box(count)
+                })
+            }
+        );
+        
+        group.bench_with_input(
+            BenchmarkId::new("random", format!("{:.0}%", probability * 100.0)),
+            &probability,
+            |b, &prob| {
+                b.iter(|| {
+                    let count = tracker.iter()
+                        .set_only()
+                        .sample(prob)
+                        .seed(42)
+                        .random()
+                        .count();
+                    black_box(count)
+                })
+            }
+        );
+    }
+    
+    group.finish();
+}
+
+/// Benchmark mixed-ratio iteration (X% existing + Y% new)
+fn bench_iter_mixed_ratio(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sampling/mixed_ratio");
+    
+    let size = 100_000u64;
+    let tracker = PrefixTracker::new(
+        TrackerConfig::simple("vec:").with_max_id(size)
+    );
+    // Set 50% of bits
+    for i in 0..size / 2 {
+        tracker.add(i);
+    }
+    
+    let iterations = 10_000u64;
+    group.throughput(Throughput::Elements(iterations));
+    
+    for ratio in [0.1, 0.5, 0.9] {
+        group.bench_with_input(
+            BenchmarkId::new("random", format!("{:.0}%_set", ratio * 100.0)),
+            &ratio,
+            |b, &ratio| {
+                b.iter(|| {
+                    let count = tracker.iter()
+                        .mixed_ratio(ratio)
+                        .seed(42)
+                        .limit(iterations)
+                        .random()
+                        .count();
+                    black_box(count)
+                })
+            }
+        );
+    }
+    
+    group.finish();
+}
+
+/// Benchmark seeded random iteration (reproducibility)
+fn bench_iter_seeded_random(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sampling/seeded");
+    
+    for size in [10_000u64, 100_000, 1_000_000] {
+        let tracker = PrefixTracker::new(
+            TrackerConfig::simple("vec:").with_max_id(size)
+        );
+        for i in (0..size).step_by(2) {
+            tracker.add(i);
+        }
+        
+        let iterations = 1000u64;
+        group.throughput(Throughput::Elements(iterations));
+        
+        group.bench_with_input(BenchmarkId::new("with_seed", size), &size, |b, _| {
+            b.iter(|| {
+                let count = tracker.iter()
+                    .set_only()
+                    .seed(12345)
+                    .limit(iterations)
+                    .random()
+                    .count();
+                black_box(count)
+            })
+        });
+        
+        group.bench_with_input(BenchmarkId::new("without_seed", size), &size, |b, _| {
+            b.iter(|| {
+                let count = tracker.iter()
+                    .set_only()
+                    .limit(iterations)
+                    .random()
+                    .count();
+                black_box(count)
+            })
+        });
+    }
+    
+    group.finish();
+}
+
+/// Benchmark range_percent iteration (upper/lower X% of keyspace)
+fn bench_iter_range_percent(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sampling/range_percent");
+    
+    let size = 100_000u64;
+    let tracker = PrefixTracker::new(
+        TrackerConfig::simple("vec:").with_max_id(size)
+    );
+    for i in 0..size {
+        tracker.add(i);
+    }
+    
+    // Benchmark different range slices
+    for (start_pct, end_pct) in [(0.0, 0.5), (0.5, 1.0), (0.25, 0.75)] {
+        let expected = (size as f64 * (end_pct - start_pct)) as u64;
+        group.throughput(Throughput::Elements(expected));
+        
+        group.bench_with_input(
+            BenchmarkId::new("sequential", format!("{:.0}-{:.0}%", start_pct * 100.0, end_pct * 100.0)),
+            &(start_pct, end_pct),
+            |b, &(start, end)| {
+                b.iter(|| {
+                    let count = tracker.iter()
+                        .set_only()
+                        .range_percent(start, end)
+                        .sequential()
+                        .count();
+                    black_box(count)
+                })
+            }
+        );
+        
+        group.bench_with_input(
+            BenchmarkId::new("random", format!("{:.0}-{:.0}%", start_pct * 100.0, end_pct * 100.0)),
+            &(start_pct, end_pct),
+            |b, &(start, end)| {
+                b.iter(|| {
+                    let count = tracker.iter()
+                        .set_only()
+                        .range_percent(start, end)
+                        .random()
+                        .count();
+                    black_box(count)
+                })
+            }
+        );
+    }
+    
+    group.finish();
+}
+
+/// Benchmark partitioned iteration with sampling
+fn bench_iter_partitioned_sampling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sampling/partitioned");
+    
+    let size = 100_000u64;
+    let tracker = Arc::new(PrefixTracker::new(
+        TrackerConfig::simple("vec:").with_max_id(size)
+    ));
+    for i in 0..size {
+        tracker.add(i);
+    }
+    
+    for num_partitions in [2, 4, 8] {
+        group.throughput(Throughput::Elements(size));
+        
+        // Without sampling
+        group.bench_with_input(
+            BenchmarkId::new("plain", num_partitions),
+            &num_partitions,
+            |b, &n| {
+                b.iter(|| {
+                    let partitions = tracker.iter().set_only().partitioned(n);
+                    let total: usize = partitions.into_iter()
+                        .map(|p| p.count())
+                        .sum();
+                    black_box(total)
+                })
+            }
+        );
+        
+        // With limit per partition
+        let limit_per_part = 1000u64;
+        group.throughput(Throughput::Elements(limit_per_part * num_partitions as u64));
+        
+        group.bench_with_input(
+            BenchmarkId::new("with_limit", num_partitions),
+            &num_partitions,
+            |b, &n| {
+                b.iter(|| {
+                    let partitions = tracker.iter()
+                        .set_only()
+                        .limit(limit_per_part)
+                        .partitioned(n);
+                    let total: usize = partitions.into_iter()
+                        .map(|p| p.count())
+                        .sum();
+                    black_box(total)
+                })
+            }
+        );
+    }
+    
+    group.finish();
+}
+
+/// Benchmark bulk bitmap operations (set_range, clear_range, count_range)
+fn bench_bitmap_bulk_operations(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bitmap/bulk");
+    
+    for size in [1_000, 10_000, 100_000, 1_000_000] {
+        group.throughput(Throughput::Elements(size as u64));
+        
+        // set_range benchmark
+        group.bench_with_input(BenchmarkId::new("set_range", size), &size, |b, &size| {
+            let bitmap = AtomicBitmap::with_capacity(size);
+            b.iter(|| {
+                bitmap.clear_range(0, size); // Reset for fair comparison
+                let count = bitmap.set_range(0, size);
+                black_box(count)
+            })
+        });
+        
+        // clear_range benchmark
+        group.bench_with_input(BenchmarkId::new("clear_range", size), &size, |b, &size| {
+            let bitmap = AtomicBitmap::with_capacity(size);
+            bitmap.set_range(0, size); // Pre-set all
+            b.iter(|| {
+                bitmap.set_range(0, size); // Reset to all set
+                let count = bitmap.clear_range(0, size);
+                black_box(count)
+            })
+        });
+        
+        // count_range benchmark
+        group.bench_with_input(BenchmarkId::new("count_range", size), &size, |b, &size| {
+            let bitmap = AtomicBitmap::with_capacity(size);
+            // Set 50% of bits
+            for i in (0..size).step_by(2) {
+                bitmap.set(i);
+            }
+            b.iter(|| {
+                let count = bitmap.count_range(0, size);
+                black_box(count)
+            })
+        });
+    }
+    
+    group.finish();
+}
+
+/// Benchmark with_sampling config (SamplingConfig struct)
+fn bench_iter_with_sampling_config(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sampling/config");
+    
+    let size = 100_000u64;
+    let tracker = PrefixTracker::new(
+        TrackerConfig::simple("vec:").with_max_id(size)
+    );
+    for i in 0..size {
+        tracker.add(i);
+    }
+    
+    // Complex sampling config: 90% set, 50% sample, limit 1000, seeded
+    let config = SamplingConfig::new()
+        .with_set_ratio(0.9)
+        .with_sample_probability(0.5)
+        .with_limit(1000)
+        .with_seed(42);
+    
+    group.throughput(Throughput::Elements(1000));
+    
+    group.bench_function("complex_config/random", |b| {
+        b.iter(|| {
+            let count = tracker.iter()
+                .with_sampling(config)
+                .random()
+                .count();
+            black_box(count)
+        })
+    });
+    
+    group.bench_function("complex_config/sequential", |b| {
+        b.iter(|| {
+            let count = tracker.iter()
+                .with_sampling(config)
+                .sequential()
+                .count();
+            black_box(count)
+        })
+    });
+    
+    group.finish();
+}
+
+/// Per-key latency benchmark (< 1µs requirement)
+fn bench_per_key_latency(c: &mut Criterion) {
+    let mut group = c.benchmark_group("latency/per_key");
+    group.sample_size(1000);
+    
+    // Test various sizes to ensure consistent per-key performance
+    for size in [10_000u64, 100_000, 1_000_000, 10_000_000] {
+        let tracker = PrefixTracker::new(
+            TrackerConfig::simple("vec:").with_max_id(size)
+        );
+        // Set 50% of bits
+        for i in (0..size).step_by(2) {
+            tracker.add(i);
+        }
+        
+        let ops_per_iter = 10_000u64;
+        group.throughput(Throughput::Elements(ops_per_iter));
+        
+        // Sequential iteration per-key
+        group.bench_with_input(
+            BenchmarkId::new("sequential/set_only", size),
+            &size,
+            |b, _| {
+                b.iter(|| {
+                    let count = tracker.iter()
+                        .set_only()
+                        .limit(ops_per_iter)
+                        .sequential()
+                        .count();
+                    black_box(count)
+                })
+            }
+        );
+        
+        // Random iteration per-key
+        group.bench_with_input(
+            BenchmarkId::new("random/set_only", size),
+            &size,
+            |b, _| {
+                b.iter(|| {
+                    let count = tracker.iter()
+                        .set_only()
+                        .seed(42)
+                        .limit(ops_per_iter)
+                        .random()
+                        .count();
+                    black_box(count)
+                })
+            }
+        );
+        
+        // Mixed ratio iteration per-key
+        group.bench_with_input(
+            BenchmarkId::new("mixed_ratio/90_10", size),
+            &size,
+            |b, _| {
+                b.iter(|| {
+                    let count = tracker.iter()
+                        .mixed_ratio(0.9)
+                        .seed(42)
+                        .limit(ops_per_iter)
+                        .random()
+                        .count();
+                    black_box(count)
+                })
+            }
+        );
+        
+        // Sampling iteration per-key
+        group.bench_with_input(
+            BenchmarkId::new("sample/50pct", size),
+            &size,
+            |b, _| {
+                b.iter(|| {
+                    let count = tracker.iter()
+                        .set_only()
+                        .sample(0.5)
+                        .seed(42)
+                        .limit(ops_per_iter)
+                        .sequential()
+                        .count();
+                    black_box(count)
+                })
+            }
+        );
+    }
+    
+    group.finish();
+}
+
+/// Benchmark delete iterator with sampling
+fn bench_iter_delete_sampling(c: &mut Criterion) {
+    let mut group = c.benchmark_group("sampling/delete");
+    
+    group.bench_function("delete_50pct", |b| {
+        b.iter_custom(|iters| {
+            let size = 10_000u64;
+            let tracker = PrefixTracker::new(
+                TrackerConfig::simple("vec:").with_max_id(size)
+            );
+            for i in 0..size {
+                tracker.add(i);
+            }
+            
+            let delete_count = size / 2;
+            let start = std::time::Instant::now();
+            
+            if let Some(mut del_iter) = tracker.iter().delete() {
+                for _ in 0..iters.min(delete_count) {
+                    black_box(del_iter.next());
+                }
+            }
+            
+            start.elapsed()
+        })
+    });
+    
+    group.finish();
+}
+
+// =============================================================================
 // SIMD Benchmarks
 // =============================================================================
 
@@ -682,7 +1174,7 @@ fn bench_simd_scan_full(c: &mut Criterion) {
         }
         
         group.throughput(Throughput::Elements(size as u64));
-        group.bench_with_input(BenchmarkId::new("find_all_set", size), &size, |b, &size| {
+        group.bench_with_input(BenchmarkId::new("find_all_set", size), &size, |b, _size| {
             b.iter(|| {
                 let mut pos = 0;
                 let mut count = 0;
@@ -786,6 +1278,20 @@ criterion_group!(
     bench_random_iter_coprime,
 );
 
+criterion_group!(
+    sampling_benches,
+    bench_iter_limit,
+    bench_iter_sample_probability,
+    bench_iter_mixed_ratio,
+    bench_iter_seeded_random,
+    bench_iter_range_percent,
+    bench_iter_partitioned_sampling,
+    bench_bitmap_bulk_operations,
+    bench_iter_with_sampling_config,
+    bench_per_key_latency,
+    bench_iter_delete_sampling,
+);
+
 criterion_main!(
     bitmap_benches,
     tracker_simple_benches,
@@ -796,4 +1302,5 @@ criterion_main!(
     concurrent_benches,
     simd_benches,
     hash_benches,
+    sampling_benches,
 );
