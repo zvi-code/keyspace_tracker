@@ -219,6 +219,12 @@ cargo bench --release -- group/
 
 # Scaling tests
 cargo bench --release -- scaling/
+
+# Sampling and iteration benchmarks
+cargo bench --release -- sampling/
+
+# Per-key latency verification (<1µs requirement)
+cargo bench --release -- latency/
 ```
 
 ---
@@ -248,6 +254,22 @@ With full optimizations on Apple M2:
 | `test_and_set` (claim) | ~2.5 ns |
 | `find_next_set` | ~3-5 ns |
 | Hierarchical exists | ~15-20 ns |
+| Iterator per-key | ~2.5-5 ns |
+| Mixed-ratio iteration | ~5 ns |
+| Sampling iteration | ~5 ns |
+| Bulk `set_range` (1M) | ~200 µs |
+| Bulk `clear_range` (1M) | ~200 µs |
+
+### Iterator Performance Requirement
+
+All iteration modes must maintain **< 1µs per key** regardless of keyspace size:
+
+| Keyspace Size | Per-Key Latency | Throughput |
+|--------------|-----------------|------------|
+| 10,000 | ~2.5 ns | 400 Melem/s |
+| 100,000 | ~5 ns | 200 Melem/s |
+| 1,000,000 | ~5 ns | 200 Melem/s |
+| 10,000,000 | ~5 ns | 195 Melem/s |
 
 Throughput scales linearly with core count for parallel operations.
 
