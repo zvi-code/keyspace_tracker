@@ -226,7 +226,38 @@ Statistical distributions for realistic workload simulation:
 | **Sequential** | `.sequential()` | Yes (partitioned) | Cache warming, full scan |
 | **Random** | `.random()` | Yes (partitioned) | Random access patterns |
 | **Overlapping** | `.overlapping().random()` | Yes | Contention testing |
-| **Claim** | `.claim()` | Yes (atomic) | Exactly-once processing |
+| **Claim** | `.write()` / `.continue_write()` | Yes (atomic) | Exactly-once processing |
+
+### Wrap-Around for Indefinite Iteration
+
+By default, iterators stop when the keyspace is exhausted. For benchmarks requiring
+indefinite iteration, use `.wrap_around()`:
+
+| Iterator | Default | With `.wrap_around()` |
+|----------|---------|----------------------|
+| `sequential()` | Stops at end | Cycles back to start |
+| `write()` | Stops when full | Clears bitmap, restarts |
+| `random()` | Samples with replacement | Already cycles (no wrap needed) |
+
+```rust
+// Sequential read - cycles through existing keys forever
+let mut iter = tracker.iter().set_only().sequential().wrap_around();
+
+// Write with wrap - clears and restarts when full
+let mut iter = tracker.iter().write().wrap_around();
+
+// Multi-threaded write with wrap-around
+tracker.reset_write_cursor();
+let handles: Vec<_> = (0..num_workers).map(|_| {
+    let t = tracker.clone();
+    thread::spawn(move || {
+        let mut iter = t.iter().continue_write().wrap_around();
+        for _ in 0..requests_per_worker {
+            iter.next().unwrap(); // Never returns None
+        }
+    })
+}).collect();
+```
 
 ### Partitioning Strategies
 
@@ -785,6 +816,20 @@ impl<'a> TrackerIterBuilder<'a> {
     /// Build write iterator (continues from current cursor position).
     /// Use when multiple workers share cursor state.
     pub fn continue_write(self) -> WriteIter<'a>;
+}
+
+/// SequentialIter methods
+impl SequentialIter<'a> {
+    /// Enable wrap-around: when iteration reaches end, restart from beginning.
+    /// Useful for benchmarks that read existing keys indefinitely.
+    pub fn wrap_around(self) -> Self;
+}
+
+/// WriteIter methods
+impl WriteIter<'a> {
+    /// Enable wrap-around: when keyspace exhausted, reset cursor and clear
+    /// bitmap to allow re-claiming IDs indefinitely.
+    pub fn wrap_around(self) -> Self;
 }
 ```
 

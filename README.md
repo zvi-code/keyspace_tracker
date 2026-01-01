@@ -189,6 +189,12 @@ for (id, _) in tracker.iter()
 {
     // ...
 }
+
+// Wrap-around for indefinite iteration
+let mut iter = tracker.iter().set_only().sequential().wrap_around();
+for _ in 0..1_000_000 {
+    let (id, _) = iter.next().unwrap(); // Cycles through set IDs forever
+}
 ```
 
 ### Random Iterator
@@ -332,6 +338,43 @@ let all_claimed: Vec<u64> = handles.into_iter()
 |--------|-----------------|----------|
 | `write()` | Resets cursor to 0 | Single iterator, fresh start |
 | `continue_write()` | Keeps current position | Multiple workers sharing cursor |
+
+#### Wrap-Around Mode
+
+By default, iterators return `None` when the keyspace is exhausted. For benchmarks
+that need indefinite iteration, enable wrap-around on any iterator type:
+
+```rust
+// Sequential wrap-around (read existing keys indefinitely)
+let mut iter = tracker.iter().set_only().sequential().wrap_around();
+for _ in 0..1_000_000 {
+    let (id, _) = iter.next().unwrap(); // Cycles through set IDs
+}
+
+// Write wrap-around (claim IDs indefinitely, clears bitmap each cycle)
+let mut iter = tracker.iter().write().wrap_around();
+for _ in 0..1_000_000 {
+    let (id, _) = iter.next().unwrap(); // Cycles through 0..max_id
+}
+
+// Multi-threaded wrap-around
+tracker.reset_write_cursor();
+let handles: Vec<_> = (0..8).map(|_| {
+    let t = tracker.clone();
+    thread::spawn(move || {
+        let mut iter = t.iter().continue_write().wrap_around();
+        for _ in 0..10_000 {
+            iter.next().unwrap();
+        }
+    })
+}).collect();
+```
+
+| Iterator | `wrap_around()` Behavior |
+|----------|-------------------------|
+| `sequential()` | Restarts from `id_min` when reaching end |
+| `write()` | Resets cursor, clears bitmap, restarts claiming |
+| `random()` | Already cycles via sampling (no wrap needed) |
 
 ### Delete Iterator
 

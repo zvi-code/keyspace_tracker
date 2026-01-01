@@ -180,6 +180,7 @@ impl<'a> TrackerIterBuilder<'a> {
             max_id,
             rng: self.sampling.make_rng(),
             yielded: 0,
+            wrap_around: false,
         }
     }
 
@@ -311,6 +312,7 @@ impl<'a> TrackerIterBuilder<'a> {
             range: self.range,
             filter: self.filter,
             max_id,
+            wrap_around: false,
         }
     }
 
@@ -345,6 +347,7 @@ impl<'a> TrackerIterBuilder<'a> {
             range: self.range,
             filter: self.filter,
             max_id,
+            wrap_around: false,
         }
     }
 
@@ -552,9 +555,37 @@ pub struct SequentialIter<'a> {
     max_id: u64,
     rng: fastrand::Rng,
     yielded: u64,
+    wrap_around: bool,
 }
 
 impl<'a> SequentialIter<'a> {
+    /// Enable wrap-around mode: when iteration reaches the end, restart from beginning.
+    ///
+    /// This is useful for benchmarks that need indefinite iteration over existing keys.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use keyspace_tracker::PrefixTracker;
+    ///
+    /// let tracker = PrefixTracker::new(100);
+    /// for i in 0..50 {
+    ///     tracker.add(i);
+    /// }
+    ///
+    /// let mut iter = tracker.iter().set_only().sequential().wrap_around();
+    ///
+    /// // Iterate more than keyspace size - wraps around
+    /// for _ in 0..200 {
+    ///     let (id, _) = iter.next().unwrap();
+    ///     // IDs cycle through set bits repeatedly
+    /// }
+    /// ```
+    pub fn wrap_around(mut self) -> Self {
+        self.wrap_around = true;
+        self
+    }
+
     /// Check if we should continue iterating (respects limit).
     #[inline]
     fn check_limit(&self) -> bool {
@@ -599,25 +630,33 @@ impl<'a> SequentialIter<'a> {
 
         let bitmap = self.tracker.primary_bitmap();
 
-        while self.current_id < self.max_id {
-            let id = self.current_id;
-            self.current_id += 1;
+        loop {
+            while self.current_id < self.max_id {
+                let id = self.current_id;
+                self.current_id += 1;
 
-            let is_set = bitmap.test(id as usize);
+                let is_set = bitmap.test(id as usize);
 
-            if !self.matches_filter(is_set) {
-                continue;
+                if !self.matches_filter(is_set) {
+                    continue;
+                }
+
+                if !self.passes_sampling() {
+                    continue;
+                }
+
+                self.yielded += 1;
+                return Some((id, None));
             }
 
-            if !self.passes_sampling() {
+            // Reached end of range
+            if self.wrap_around {
+                // Reset to beginning for next cycle
+                self.current_id = self.range.id_min;
                 continue;
             }
-
-            self.yielded += 1;
-            return Some((id, None));
+            return None;
         }
-
-        None
     }
 
     /// Get next (id, sub_id) for hierarchical trackers.
@@ -631,6 +670,11 @@ impl<'a> SequentialIter<'a> {
         loop {
             // Check if we've exhausted all primary IDs
             if self.current_id >= self.max_id {
+                if self.wrap_around {
+                    self.current_id = self.range.id_min;
+                    self.current_sub_id = self.range.sub_id_min;
+                    continue;
+                }
                 return None;
             }
 
@@ -823,12 +867,37 @@ pub struct WriteIter<'a> {
     range: IdRange,
     filter: BitFilter,
     max_id: u64,
+    wrap_around: bool,
 }
 
 impl<'a> WriteIter<'a> {
+    /// Enable wrap-around mode: when keyspace is exhausted, reset cursor to 0
+    /// and clear the bitmap to allow re-claiming IDs.
+    ///
+    /// This is useful for benchmarks that need to iterate indefinitely.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use keyspace_tracker::PrefixTracker;
+    ///
+    /// let tracker = PrefixTracker::new(100);
+    /// let mut iter = tracker.iter().write().wrap_around();
+    ///
+    /// // Will never return None - wraps around when exhausted
+    /// for _ in 0..1000 {
+    ///     let (id, _) = iter.next().unwrap();
+    ///     // Process id (0-99, then wraps back to 0)
+    /// }
+    /// ```
+    pub fn wrap_around(mut self) -> Self {
+        self.wrap_around = true;
+        self
+    }
+
     /// Atomically claim next ID and mark as set.
     ///
-    /// Returns `None` when range is exhausted.
+    /// Returns `None` when range is exhausted (unless `wrap_around()` is enabled).
     pub fn next(&mut self) -> Option<TrackerItem> {
         if self.tracker.is_hierarchical() {
             self.next_hierarchical()
@@ -847,6 +916,12 @@ impl<'a> WriteIter<'a> {
                 loop {
                     let start = cursor.load(Ordering::Acquire);
                     if start >= self.max_id {
+                        if self.wrap_around {
+                            // Reset cursor and clear bitmap for next cycle
+                            bitmap.clear_range(self.range.id_min as usize, self.max_id as usize);
+                            cursor.store(self.range.id_min, Ordering::Release);
+                            continue;
+                        }
                         return None;
                     }
 
@@ -867,6 +942,12 @@ impl<'a> WriteIter<'a> {
                         // Someone else claimed it, retry
                     } else {
                         // No more unset bits
+                        if self.wrap_around {
+                            // Reset cursor and clear bitmap for next cycle
+                            bitmap.clear_range(self.range.id_min as usize, self.max_id as usize);
+                            cursor.store(self.range.id_min, Ordering::Release);
+                            continue;
+                        }
                         cursor.store(self.max_id, Ordering::Release);
                         return None;
                     }
@@ -877,6 +958,11 @@ impl<'a> WriteIter<'a> {
                 loop {
                     let id = cursor.fetch_add(1, Ordering::AcqRel);
                     if id >= self.max_id {
+                        if self.wrap_around {
+                            // Reset cursor for next cycle (don't clear - All mode doesn't care)
+                            cursor.store(self.range.id_min, Ordering::Release);
+                            continue;
+                        }
                         return None;
                     }
                     if id < self.range.id_min {
@@ -1830,5 +1916,155 @@ mod tests {
         let mut iter5 = tracker.iter().continue_write();
         let (id5, _) = iter5.next().unwrap();
         assert_eq!(id5, 2, "continue_write() should continue advancing");
+    }
+
+    #[test]
+    fn test_write_wrap_around() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(10));
+
+        // Without wrap_around - stops at exhaustion
+        let mut iter = tracker.iter().write();
+        let mut count = 0;
+        while iter.next().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, 10);
+        assert!(iter.next().is_none(), "Should stop at exhaustion");
+
+        // With wrap_around - continues indefinitely
+        tracker.reset_write_cursor();
+        let mut iter = tracker.iter().write().wrap_around();
+        
+        // Claim more than keyspace size
+        let mut ids = Vec::new();
+        for _ in 0..25 {
+            let (id, _) = iter.next().unwrap();
+            ids.push(id);
+        }
+
+        // Should have wrapped around at least twice
+        assert_eq!(ids.len(), 25);
+        
+        // Check wraparound occurred - IDs should cycle through 0-9
+        assert!(ids[10..20].iter().all(|&id| id < 10), "Second cycle should be 0-9");
+        assert!(ids[20..25].iter().all(|&id| id < 10), "Third cycle should be 0-9");
+    }
+
+    #[test]
+    fn test_write_wrap_around_multithreaded() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let tracker = Arc::new(PrefixTracker::new(
+            TrackerConfig::simple("vec:").with_max_id(100),
+        ));
+        let total_claimed = Arc::new(AtomicU64::new(0));
+
+        // Reset cursor once before spawning workers
+        tracker.reset_write_cursor();
+
+        let num_workers = 4;
+        let claims_per_worker = 500; // 2000 total claims for 100 IDs = 20 full cycles
+
+        let handles: Vec<_> = (0..num_workers)
+            .map(|_| {
+                let t = tracker.clone();
+                let counter = total_claimed.clone();
+                thread::spawn(move || {
+                    // Use continue_write() with wrap_around for concurrent access
+                    let mut iter = t.iter().continue_write().wrap_around();
+
+                    for _ in 0..claims_per_worker {
+                        let (id, _) = iter.next().unwrap();
+                        assert!(id < 100, "ID should be within range");
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // All workers should have completed their claims
+        assert_eq!(
+            total_claimed.load(Ordering::SeqCst),
+            (num_workers * claims_per_worker) as u64
+        );
+    }
+
+    #[test]
+    fn test_sequential_wrap_around() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(10));
+        
+        // Add some IDs
+        for i in 0..5 {
+            tracker.add(i);
+        }
+
+        // Without wrap_around - stops at end
+        let count = tracker.iter().set_only().sequential().count();
+        assert_eq!(count, 5);
+
+        // With wrap_around - continues indefinitely (use limit to stop)
+        let mut iter = tracker.iter().set_only().sequential().wrap_around();
+        let mut ids = Vec::new();
+        for _ in 0..15 {
+            let (id, _) = iter.next().unwrap();
+            ids.push(id);
+        }
+
+        // Should cycle through set IDs (0,1,2,3,4) three times
+        assert_eq!(ids.len(), 15);
+        assert_eq!(ids[0..5], [0, 1, 2, 3, 4]);
+        assert_eq!(ids[5..10], [0, 1, 2, 3, 4]);
+        assert_eq!(ids[10..15], [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn test_sequential_wrap_around_multithreaded() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let tracker = Arc::new(PrefixTracker::new(
+            TrackerConfig::simple("vec:").with_max_id(100),
+        ));
+
+        // Add all IDs
+        for i in 0..100 {
+            tracker.add(i);
+        }
+
+        let total_read = Arc::new(AtomicU64::new(0));
+        let num_workers = 4;
+        let reads_per_worker = 500;
+
+        let handles: Vec<_> = (0..num_workers)
+            .map(|_| {
+                let t = tracker.clone();
+                let counter = total_read.clone();
+                thread::spawn(move || {
+                    let mut iter = t.iter().set_only().sequential().wrap_around();
+
+                    for _ in 0..reads_per_worker {
+                        let (id, _) = iter.next().unwrap();
+                        assert!(id < 100, "ID should be within range");
+                        counter.fetch_add(1, Ordering::Relaxed);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(
+            total_read.load(Ordering::SeqCst),
+            (num_workers * reads_per_worker) as u64
+        );
     }
 }
