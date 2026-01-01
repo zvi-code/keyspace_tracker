@@ -312,6 +312,10 @@ impl<'a> IteratorBuilder<'a> {
     /// Returns None if another delete iterator is active.
     pub fn delete(self) -> Option<DeleteIter<'a>>;
     
+    /// Build a single partition for independent worker processing.
+    /// Each worker can independently call partition(index, total) without coordination.
+    pub fn partition(self, index: usize, total: usize) -> PartitionedIter<'a>;
+    
     /// Build partitioned iterators for parallel processing.
     /// Returns `n` iterators with disjoint ranges covering the full space.
     pub fn partitioned(self, n: usize) -> Vec<PartitionedIter<'a>>;
@@ -529,6 +533,23 @@ pub struct PartitionedIter<'a> {
 **Factory Implementation**:
 ```rust
 impl<'a> IteratorBuilder<'a> {
+    /// Create a single partition - each worker independently computes its range.
+    pub fn partition(self, index: usize, total: usize) -> PartitionedIter<'a> {
+        assert!(total > 0 && index < total);
+        let range_size = self.max_id - self.min_id;
+        let chunk_size = (range_size + total as u64 - 1) / total as u64;
+        let start = self.min_id + index as u64 * chunk_size;
+        let end = (start + chunk_size).min(self.max_id);
+        PartitionedIter {
+            tracker: self.tracker,
+            start,
+            end,
+            current: start,
+            filter: self.filter,
+        }
+    }
+    
+    /// Create all partitions at once (for central distribution).
     pub fn partitioned(self, n: usize) -> Vec<PartitionedIter<'a>> {
         let total = self.max_id - self.min_id;
         let chunk_size = (total + n as u64 - 1) / n as u64;  // Ceiling division

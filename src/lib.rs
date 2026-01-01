@@ -147,6 +147,40 @@
 //! assert_eq!(total, 1000);
 //! ```
 //!
+//! ### Independent Worker Partitioning
+//!
+//! ```rust
+//! use keyspace_tracker::PrefixTracker;
+//! use std::sync::Arc;
+//! use std::thread;
+//!
+//! let tracker = Arc::new(PrefixTracker::simple("data:"));
+//! for i in 0..10000u64 {
+//!     tracker.add(i);
+//! }
+//!
+//! let num_workers = 4;
+//! let handles: Vec<_> = (0..num_workers)
+//!     .map(|worker_id| {
+//!         let t = tracker.clone();
+//!         thread::spawn(move || {
+//!             // Each worker independently computes its partition - no coordination needed
+//!             let mut count = 0u64;
+//!             for (id, _) in t.iter()
+//!                 .set_only()
+//!                 .partition(worker_id, num_workers)
+//!             {
+//!                 count += 1;
+//!             }
+//!             count
+//!         })
+//!     })
+//!     .collect();
+//!
+//! let total: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+//! assert_eq!(total, 10000);
+//! ```
+//!
 //! ### Group Iteration with Policies
 //!
 //! ```rust

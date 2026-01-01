@@ -232,9 +232,30 @@ Statistical distributions for realistic workload simulation:
 
 | Strategy | Method | Use Case |
 |----------|--------|----------|
-| **Thread-based** | `.partition(thread_id, num_threads)` | Distribute work across threads |
+| **Independent workers** | `.partition(index, total)` | Each worker computes its own shard |
+| **Central distribution** | `.partitioned(n)` | Coordinator distributes partitions |
 | **Slot-based** | Multiple trackers by slot range | Align with cluster topology |
 | **Range-based** | `.id_range(start, end)` | Process specific ID ranges |
+
+**Independent Worker Pattern** (preferred for benchmarks):
+```rust
+// Each worker independently creates its partition - no coordination needed
+for (id, _) in tracker.iter()
+    .set_only()
+    .partition(worker_id, num_workers)  // Returns PartitionedIter directly
+{
+    // Process this worker's disjoint range
+}
+```
+
+**Central Distribution Pattern**:
+```rust
+// Coordinator creates all partitions, then distributes
+let partitions = tracker.iter().set_only().partitioned(num_workers);
+for (worker_id, partition) in partitions.into_iter().enumerate() {
+    // Send partition to worker
+}
+```
 
 ---
 
@@ -681,7 +702,11 @@ impl<'a> TrackerIterBuilder<'a> {
     pub fn mixed_ratio(self, existing_ratio: f64) -> Self;
     
     // === Partitioning ===
-    pub fn partition(self, index: usize, total: usize) -> Self;
+    /// Create a single partition for independent worker processing.
+    /// Each worker can independently call partition(my_id, total) without coordination.
+    pub fn partition(self, index: usize, total: usize) -> PartitionedIter<'a>;
+    /// Create all partitions at once (for central distribution).
+    pub fn partitioned(self, n: usize) -> Vec<PartitionedIter<'a>>;
     pub fn overlapping(self) -> Self;
     
     // === Sampling ===
