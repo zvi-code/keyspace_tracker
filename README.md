@@ -311,6 +311,7 @@ Parallel iteration with disjoint ranges:
 ```rust
 use std::thread;
 
+// Option 1: Create all partitions centrally, then distribute
 let partitions = tracker.iter().set_only().partitioned(4);
 
 let handles: Vec<_> = partitions
@@ -327,6 +328,37 @@ let handles: Vec<_> = partitions
     .collect();
 
 let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
+```
+
+### Independent Worker Partitioning
+
+Each worker independently creates its own partition without coordination:
+
+```rust
+use std::sync::Arc;
+use std::thread;
+
+let tracker = Arc::new(tracker);
+let num_workers = 8;
+
+let handles: Vec<_> = (0..num_workers)
+    .map(|worker_id| {
+        let t = tracker.clone();
+        thread::spawn(move || {
+            // Each worker computes its own range - no central coordination
+            let mut count = 0u64;
+            for (id, _) in t.iter()
+                .set_only()
+                .partition(worker_id, num_workers)  // Single partition by index
+            {
+                count += 1;
+            }
+            count
+        })
+    })
+    .collect();
+
+let total: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
 ```
 
 ### Overlapping Mode (Contention Testing)

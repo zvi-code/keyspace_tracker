@@ -213,6 +213,47 @@ impl<'a> GroupIterBuilder<'a> {
             })
             .collect()
     }
+
+    /// Build a single partition iterator for independent parallel processing.
+    ///
+    /// Unlike `partitioned(n)` which returns all partitions, this method creates
+    /// a single partition iterator given the partition index and total count.
+    /// This enables each worker thread to independently create its own iterator
+    /// without coordination or access to other partitions.
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The partition index (0-based, must be < `total`)
+    /// * `total` - Total number of partitions
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= total` or `total == 0`.
+    pub fn partition(self, index: usize, total: usize) -> GroupPartitionedIter {
+        assert!(total > 0, "total partitions must be > 0");
+        assert!(index < total, "partition index {} must be < total {}", index, total);
+
+        let trackers = self.filtered_trackers();
+        let range_size = self.range.id_max.saturating_sub(self.range.id_min);
+        let chunk_size = (range_size + total as u64 - 1) / total as u64;
+
+        let start = self.range.id_min + index as u64 * chunk_size;
+        let end = (start + chunk_size).min(self.range.id_max);
+
+        GroupPartitionedIter {
+            trackers,
+            range: IdRange {
+                id_min: start,
+                id_max: end,
+                sub_id_min: self.range.sub_id_min,
+                sub_id_max: self.range.sub_id_max,
+            },
+            bit_filter: self.bit_filter,
+            prefix_index: 0,
+            current_id: start,
+            current_sub_id: self.range.sub_id_min,
+        }
+    }
 }
 
 // ============================================================================

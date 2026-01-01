@@ -391,6 +391,109 @@ impl<'a> TrackerIterBuilder<'a> {
             })
             .collect()
     }
+
+    /// Build a single partition iterator for independent parallel processing.
+    ///
+    /// Unlike `partitioned(n)` which returns all partitions, this method creates
+    /// a single partition iterator given the partition index and total count.
+    /// This enables each worker thread to independently create its own iterator
+    /// without coordination or access to other partitions.
+    ///
+    /// # Arguments
+    ///
+    /// * `index` - The partition index (0-based, must be < `total`)
+    /// * `total` - Total number of partitions
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= total` or `total == 0`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use keyspace_tracker::PrefixTracker;
+    /// use std::thread;
+    /// use std::sync::Arc;
+    ///
+    /// let tracker = Arc::new(PrefixTracker::simple("data:"));
+    /// for i in 0..1000u64 {
+    ///     tracker.add(i);
+    /// }
+    ///
+    /// let num_workers = 4;
+    /// let handles: Vec<_> = (0..num_workers)
+    ///     .map(|worker_id| {
+    ///         let t = tracker.clone();
+    ///         thread::spawn(move || {
+    ///             // Each worker independently creates its own partition
+    ///             let mut count = 0u64;
+    ///             for (id, _) in t.iter()
+    ///                 .set_only()
+    ///                 .partition(worker_id, num_workers)
+    ///             {
+    ///                 count += 1;
+    ///             }
+    ///             count
+    ///         })
+    ///     })
+    ///     .collect();
+    ///
+    /// let total: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+    /// assert_eq!(total, 1000);
+    /// ```
+    pub fn partition(self, index: usize, total: usize) -> PartitionedIter<'a> {
+        assert!(total > 0, "total partitions must be > 0");
+        assert!(index < total, "partition index {} must be < total {}", index, total);
+
+        let max_id = self.range.id_max.min(self.tracker.effective_max_id());
+        let range_size = max_id.saturating_sub(self.range.id_min);
+
+        // In overlapping mode, each partition iterates the full range
+        let overlapping = self.sampling.overlapping;
+        let chunk_size = if overlapping {
+            range_size // Each partition gets full range
+        } else {
+            (range_size + total as u64 - 1) / total as u64
+        };
+
+        let (start, end) = if overlapping {
+            (self.range.id_min, max_id)
+        } else {
+            let start = self.range.id_min + index as u64 * chunk_size;
+            let end = (start + chunk_size).min(max_id);
+            (start, end)
+        };
+
+        // Per-partition limit if overall limit is set
+        let per_partition_limit = if overlapping {
+            self.sampling.limit
+        } else {
+            self.sampling.limit.map(|l| (l + total as u64 - 1) / total as u64)
+        };
+
+        // Create per-partition sampling config
+        let mut partition_sampling = self.sampling;
+        partition_sampling.limit = per_partition_limit;
+        if let Some(seed) = self.sampling.seed {
+            partition_sampling.seed = Some(seed.wrapping_add(index as u64));
+        }
+
+        PartitionedIter {
+            tracker: self.tracker,
+            range: IdRange {
+                id_min: start,
+                id_max: end,
+                sub_id_min: self.range.sub_id_min,
+                sub_id_max: self.range.sub_id_max,
+            },
+            filter: self.filter,
+            sampling: partition_sampling,
+            current_id: start,
+            current_sub_id: self.range.sub_id_min,
+            rng: partition_sampling.make_rng(),
+            yielded: 0,
+        }
+    }
 }
 
 // ============================================================================
@@ -1491,5 +1594,120 @@ mod tests {
                 assert!(r1.id_max <= r2.id_min || r2.id_max <= r1.id_min);
             }
         }
+    }
+
+    #[test]
+    fn test_single_partition() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(100));
+        for i in 0..100 {
+            tracker.add(i);
+        }
+
+        // Each worker independently creates its partition
+        let total = 4;
+        let mut all_items = Vec::new();
+
+        for worker_id in 0..total {
+            let items: Vec<_> = tracker
+                .iter()
+                .set_only()
+                .partition(worker_id, total)
+                .collect();
+            all_items.extend(items);
+        }
+
+        all_items.sort_by_key(|(id, _)| *id);
+        assert_eq!(all_items.len(), 100);
+    }
+
+    #[test]
+    fn test_partition_equals_partitioned() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(1000));
+        for i in 0..1000 {
+            tracker.add(i);
+        }
+
+        let total = 8;
+        
+        // Get all partitions at once
+        let all_partitions = tracker.iter().set_only().partitioned(total);
+        
+        // Get each partition independently
+        for (index, partition) in all_partitions.into_iter().enumerate() {
+            let independent = tracker.iter().set_only().partition(index, total);
+            
+            // Ranges should match
+            assert_eq!(partition.range().id_min, independent.range().id_min);
+            assert_eq!(partition.range().id_max, independent.range().id_max);
+        }
+    }
+
+    #[test]
+    fn test_partition_disjoint_ranges() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(1000));
+        for i in 0..1000 {
+            tracker.add(i);
+        }
+
+        let total = 8;
+        let mut ranges = Vec::new();
+
+        for i in 0..total {
+            let p = tracker.iter().set_only().partition(i, total);
+            ranges.push((p.range().id_min, p.range().id_max));
+        }
+
+        // Check disjoint
+        for i in 0..total {
+            for j in (i + 1)..total {
+                assert!(
+                    ranges[i].1 <= ranges[j].0 || ranges[j].1 <= ranges[i].0,
+                    "Partitions {} and {} overlap", i, j
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "partition index")]
+    fn test_partition_index_out_of_bounds() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(100));
+        tracker.iter().partition(5, 4); // index >= total should panic
+    }
+
+    #[test]
+    #[should_panic(expected = "total partitions must be > 0")]
+    fn test_partition_zero_total() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(100));
+        tracker.iter().partition(0, 0); // total == 0 should panic
+    }
+
+    #[test]
+    fn test_partition_concurrent() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let tracker = Arc::new(PrefixTracker::new(
+            TrackerConfig::simple("vec:").with_max_id(10000),
+        ));
+        for i in 0..10000 {
+            tracker.add(i);
+        }
+
+        let num_workers = 8;
+        let handles: Vec<_> = (0..num_workers)
+            .map(|worker_id| {
+                let t = tracker.clone();
+                thread::spawn(move || {
+                    t.iter()
+                        .set_only()
+                        .partition(worker_id, num_workers)
+                        .count() as u64
+                })
+            })
+            .collect();
+
+        let total: u64 = handles.into_iter().map(|h: thread::JoinHandle<u64>| h.join().unwrap()).sum();
+        assert_eq!(total, 10000);
     }
 }

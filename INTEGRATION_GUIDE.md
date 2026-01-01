@@ -516,11 +516,10 @@ let handles: Vec<_> = (0..num_threads).map(|thread_id| {
     thread::spawn(move || {
         let mut count = 0u64;
         
-        // Each thread gets disjoint keys
+        // Each thread independently computes its own disjoint range
         for (id, _) in tracker.iter()
             .unset_only()
-            .partition(thread_id, num_threads)
-            .sequential()
+            .partition(thread_id, num_threads)  // Returns PartitionedIter directly
         {
             let vector = dataset.get_vector(id as usize);
             valkey.hset(format!("vec:{}", id), "embedding", vector);
