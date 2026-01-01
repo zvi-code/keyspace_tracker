@@ -506,10 +506,10 @@ fn bench_concurrent_claims(c: &mut Criterion) {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
 
-    let mut group = c.benchmark_group("concurrent");
+    let mut group = c.benchmark_group("concurrent/claim");
     
-    for threads in [1, 2, 4, 8] {
-        group.bench_with_input(BenchmarkId::new("claim", threads), &threads, |b, &threads| {
+    for threads in [1, 2, 4, 8, 16] {
+        group.bench_with_input(BenchmarkId::new("disjoint", threads), &threads, |b, &threads| {
             b.iter_custom(|iters| {
                 let tracker = Arc::new(PrefixTracker::new(
                     TrackerConfig::simple("test:").with_max_id(iters * threads as u64 * 100)
@@ -525,6 +525,536 @@ fn bench_concurrent_claims(c: &mut Criterion) {
                         for _ in 0..iters {
                             let id = counter.fetch_add(1, Ordering::Relaxed);
                             black_box(tracker.claim(id));
+                        }
+                    })
+                }).collect();
+                
+                for h in handles {
+                    h.join().unwrap();
+                }
+                
+                start.elapsed()
+            })
+        });
+        
+        // Contention: all threads claim from same small range
+        group.bench_with_input(BenchmarkId::new("contention", threads), &threads, |b, &threads| {
+            b.iter_custom(|iters| {
+                let tracker = Arc::new(PrefixTracker::new(
+                    TrackerConfig::simple("test:").with_max_id(1000) // Small range = high contention
+                ));
+                
+                let start = std::time::Instant::now();
+                
+                let handles: Vec<_> = (0..threads).map(|_| {
+                    let tracker = tracker.clone();
+                    thread::spawn(move || {
+                        for i in 0..iters {
+                            let id = i % 1000;
+                            black_box(tracker.claim(id));
+                        }
+                    })
+                }).collect();
+                
+                for h in handles {
+                    h.join().unwrap();
+                }
+                
+                start.elapsed()
+            })
+        });
+    }
+    
+    group.finish();
+}
+
+/// Benchmark concurrent bitmap set operations
+fn bench_concurrent_bitmap_set(c: &mut Criterion) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
+
+    let mut group = c.benchmark_group("concurrent/bitmap");
+    
+    for threads in [1, 2, 4, 8, 16] {
+        // Disjoint: each thread sets different bits
+        group.bench_with_input(BenchmarkId::new("set_disjoint", threads), &threads, |b, &threads| {
+            b.iter_custom(|iters| {
+                let bitmap = Arc::new(AtomicBitmap::with_capacity((iters * threads as u64 * 100) as usize));
+                let counter = Arc::new(AtomicU64::new(0));
+                
+                let start = std::time::Instant::now();
+                
+                let handles: Vec<_> = (0..threads).map(|_| {
+                    let bitmap = bitmap.clone();
+                    let counter = counter.clone();
+                    thread::spawn(move || {
+                        for _ in 0..iters {
+                            let idx = counter.fetch_add(1, Ordering::Relaxed) as usize;
+                            black_box(bitmap.set(idx));
+                        }
+                    })
+                }).collect();
+                
+                for h in handles {
+                    h.join().unwrap();
+                }
+                
+                start.elapsed()
+            })
+        });
+        
+        // Contention: all threads hit same bits
+        group.bench_with_input(BenchmarkId::new("set_contention", threads), &threads, |b, &threads| {
+            b.iter_custom(|iters| {
+                let bitmap = Arc::new(AtomicBitmap::with_capacity(1000));
+                
+                let start = std::time::Instant::now();
+                
+                let handles: Vec<_> = (0..threads).map(|_| {
+                    let bitmap = bitmap.clone();
+                    thread::spawn(move || {
+                        for i in 0..iters {
+                            let idx = (i % 1000) as usize;
+                            black_box(bitmap.set(idx));
+                        }
+                    })
+                }).collect();
+                
+                for h in handles {
+                    h.join().unwrap();
+                }
+                
+                start.elapsed()
+            })
+        });
+        
+        // test_and_set (CAS) with contention
+        group.bench_with_input(BenchmarkId::new("test_and_set_contention", threads), &threads, |b, &threads| {
+            b.iter_custom(|iters| {
+                let bitmap = Arc::new(AtomicBitmap::with_capacity(10000));
+                
+                let start = std::time::Instant::now();
+                
+                let handles: Vec<_> = (0..threads).map(|_| {
+                    let bitmap = bitmap.clone();
+                    thread::spawn(move || {
+                        for i in 0..iters {
+                            let idx = (i % 10000) as usize;
+                            black_box(bitmap.test_and_set(idx));
+                        }
+                    })
+                }).collect();
+                
+                for h in handles {
+                    h.join().unwrap();
+                }
+                
+                start.elapsed()
+            })
+        });
+    }
+    
+    group.finish();
+}
+
+/// Benchmark concurrent partitioned iteration (the main use case)
+fn bench_concurrent_partition_iter(c: &mut Criterion) {
+    use std::thread;
+
+    let mut group = c.benchmark_group("concurrent/partition");
+    group.sample_size(50); // Reduce sample size for longer-running benchmarks
+    
+    let size = 1_000_000u64;
+    
+    for threads in [1, 2, 4, 8, 16] {
+        // Each thread iterates its own partition - no contention
+        group.throughput(Throughput::Elements(size));
+        group.bench_with_input(BenchmarkId::new("sequential_set_only", threads), &threads, |b, &threads| {
+            // Pre-create tracker with data
+            let tracker = Arc::new(PrefixTracker::new(
+                TrackerConfig::simple("part:").with_max_id(size)
+            ));
+            for i in 0..size {
+                tracker.add(i);
+            }
+            
+            b.iter(|| {
+                let handles: Vec<_> = (0..threads).map(|thread_id| {
+                    let tracker = tracker.clone();
+                    thread::spawn(move || {
+                        let mut count = 0u64;
+                        for (id, _) in tracker.iter()
+                            .set_only()
+                            .partition(thread_id, threads)
+                        {
+                            black_box(id);
+                            count += 1;
+                        }
+                        count
+                    })
+                }).collect();
+                
+                let total: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+                black_box(total)
+            })
+        });
+        
+        // Partitioned iteration (PartitionedIter is already a concrete iterator)
+        group.bench_with_input(BenchmarkId::new("partitioned_iterate", threads), &threads, |b, &threads| {
+            let tracker = Arc::new(PrefixTracker::new(
+                TrackerConfig::simple("part:").with_max_id(size)
+            ));
+            for i in 0..size {
+                tracker.add(i);
+            }
+            
+            b.iter(|| {
+                let handles: Vec<_> = (0..threads).map(|thread_id| {
+                    let tracker = tracker.clone();
+                    thread::spawn(move || {
+                        let mut count = 0u64;
+                        // PartitionedIter is already a sequential iterator over its range
+                        for (id, _) in tracker.iter()
+                            .set_only()
+                            .partition(thread_id, threads)
+                        {
+                            black_box(id);
+                            count += 1;
+                        }
+                        count
+                    })
+                }).collect();
+                
+                let total: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+                black_box(total)
+            })
+        });
+    }
+    
+    group.finish();
+}
+
+/// Benchmark concurrent write iteration (claiming unset IDs)
+fn bench_concurrent_write_iter(c: &mut Criterion) {
+    use std::thread;
+
+    let mut group = c.benchmark_group("concurrent/write_iter");
+    group.sample_size(50);
+    
+    let size = 100_000u64;
+    
+    for threads in [1, 2, 4, 8, 16] {
+        group.throughput(Throughput::Elements(size));
+        
+        // WriteIter claiming from empty tracker
+        group.bench_with_input(BenchmarkId::new("claim_empty", threads), &threads, |b, &threads| {
+            b.iter(|| {
+                let tracker = Arc::new(PrefixTracker::new(
+                    TrackerConfig::simple("write:").with_max_id(size)
+                ));
+                
+                let handles: Vec<_> = (0..threads).map(|_| {
+                    let tracker = tracker.clone();
+                    thread::spawn(move || {
+                        let mut count = 0u64;
+                        let mut writer = tracker.iter().unset_only().write();
+                        while let Some(item) = writer.next() {
+                            black_box(item);
+                            count += 1;
+                        }
+                        count
+                    })
+                }).collect();
+                
+                let total: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+                assert_eq!(total, size);
+                black_box(total)
+            })
+        });
+        
+        // Partitioned claiming (each thread claims IDs in its partition)
+        group.bench_with_input(BenchmarkId::new("claim_partitioned", threads), &threads, |b, &threads| {
+            b.iter(|| {
+                let tracker = Arc::new(PrefixTracker::new(
+                    TrackerConfig::simple("write:").with_max_id(size)
+                ));
+                
+                let handles: Vec<_> = (0..threads).map(|thread_id| {
+                    let tracker = tracker.clone();
+                    thread::spawn(move || {
+                        let mut count = 0u64;
+                        // Iterate partition and claim each ID
+                        for (id, _) in tracker.iter()
+                            .unset_only()
+                            .partition(thread_id, threads)
+                        {
+                            if tracker.claim(id) {
+                                black_box(id);
+                                count += 1;
+                            }
+                        }
+                        count
+                    })
+                }).collect();
+                
+                let total: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+                black_box(total)
+            })
+        });
+    }
+    
+    group.finish();
+}
+
+/// Benchmark concurrent tracker add/exists operations
+fn bench_concurrent_tracker_ops(c: &mut Criterion) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
+
+    let mut group = c.benchmark_group("concurrent/tracker");
+    
+    let size = 1_000_000u64;
+    
+    for threads in [1, 2, 4, 8, 16] {
+        // Concurrent adds to different IDs
+        group.bench_with_input(BenchmarkId::new("add_disjoint", threads), &threads, |b, &threads| {
+            b.iter_custom(|iters| {
+                let tracker = Arc::new(PrefixTracker::new(
+                    TrackerConfig::simple("test:").with_max_id(size)
+                ));
+                let counter = Arc::new(AtomicU64::new(0));
+                
+                let start = std::time::Instant::now();
+                
+                let handles: Vec<_> = (0..threads).map(|_| {
+                    let tracker = tracker.clone();
+                    let counter = counter.clone();
+                    thread::spawn(move || {
+                        for _ in 0..iters {
+                            let id = counter.fetch_add(1, Ordering::Relaxed) % size;
+                            black_box(tracker.add(id));
+                        }
+                    })
+                }).collect();
+                
+                for h in handles {
+                    h.join().unwrap();
+                }
+                
+                start.elapsed()
+            })
+        });
+        
+        // Concurrent exists checks (read-heavy, should scale well)
+        group.bench_with_input(BenchmarkId::new("exists_readonly", threads), &threads, |b, &threads| {
+            let tracker = Arc::new(PrefixTracker::new(
+                TrackerConfig::simple("test:").with_max_id(size)
+            ));
+            // Pre-populate 50%
+            for i in (0..size).step_by(2) {
+                tracker.add(i);
+            }
+            
+            b.iter_custom(|iters| {
+                let start = std::time::Instant::now();
+                
+                let handles: Vec<_> = (0..threads).map(|thread_id| {
+                    let tracker = tracker.clone();
+                    thread::spawn(move || {
+                        let offset = thread_id as u64 * 12345; // Different starting points
+                        for i in 0..iters {
+                            let id = (offset + i) % size;
+                            black_box(tracker.exists(id));
+                        }
+                    })
+                }).collect();
+                
+                for h in handles {
+                    h.join().unwrap();
+                }
+                
+                start.elapsed()
+            })
+        });
+        
+        // Mixed read/write (80% read, 20% write)
+        group.bench_with_input(BenchmarkId::new("mixed_80_20", threads), &threads, |b, &threads| {
+            b.iter_custom(|iters| {
+                let tracker = Arc::new(PrefixTracker::new(
+                    TrackerConfig::simple("test:").with_max_id(size)
+                ));
+                // Pre-populate 50%
+                for i in (0..size).step_by(2) {
+                    tracker.add(i);
+                }
+                
+                let start = std::time::Instant::now();
+                
+                let handles: Vec<_> = (0..threads).map(|thread_id| {
+                    let tracker = tracker.clone();
+                    thread::spawn(move || {
+                        let offset = thread_id as u64 * 12345;
+                        for i in 0..iters {
+                            let id = (offset + i) % size;
+                            if i % 5 == 0 {
+                                // 20% writes
+                                black_box(tracker.add(id));
+                            } else {
+                                // 80% reads
+                                black_box(tracker.exists(id));
+                            }
+                        }
+                    })
+                }).collect();
+                
+                for h in handles {
+                    h.join().unwrap();
+                }
+                
+                start.elapsed()
+            })
+        });
+    }
+    
+    group.finish();
+}
+
+/// Benchmark concurrent group operations
+fn bench_concurrent_group_ops(c: &mut Criterion) {
+    use std::thread;
+
+    let mut group = c.benchmark_group("concurrent/group");
+    group.sample_size(50);
+    
+    for threads in [1, 2, 4, 8] {
+        // Concurrent registration and lookup
+        group.bench_with_input(BenchmarkId::new("register_lookup", threads), &threads, |b, &threads| {
+            b.iter_custom(|iters| {
+                let groups = Arc::new(PrefixGroupsTracker::new());
+                
+                // Pre-register some prefixes
+                for i in 0..100 {
+                    groups.register(TrackerConfig::simple(&format!("prefix{}:", i)));
+                }
+                
+                let start = std::time::Instant::now();
+                
+                let handles: Vec<_> = (0..threads).map(|thread_id| {
+                    let groups = groups.clone();
+                    thread::spawn(move || {
+                        for i in 0..iters {
+                            let prefix = format!("prefix{}:", (thread_id as u64 * 1000 + i) % 100);
+                            if i % 10 == 0 {
+                                // 10% new registrations
+                                black_box(groups.register(TrackerConfig::simple(&format!("new{}_{}", thread_id, i))));
+                            } else {
+                                // 90% lookups
+                                black_box(groups.get(&prefix));
+                            }
+                        }
+                    })
+                }).collect();
+                
+                for h in handles {
+                    h.join().unwrap();
+                }
+                
+                start.elapsed()
+            })
+        });
+        
+        // Concurrent group iteration with write
+        group.bench_with_input(BenchmarkId::new("write_round_robin", threads), &threads, |b, &threads| {
+            b.iter(|| {
+                let groups = Arc::new(PrefixGroupsTracker::new());
+                for i in 0..4 {
+                    groups.register(TrackerConfig::simple(&format!("g{}:", i)).with_max_id(10000));
+                }
+                
+                let handles: Vec<_> = (0..threads).map(|_| {
+                    let groups = groups.clone();
+                    thread::spawn(move || {
+                        let mut writer = groups.iter().write(ClaimPolicy::RoundRobin);
+                        let mut count = 0u64;
+                        while let Some(item) = writer.next() {
+                            black_box(item);
+                            count += 1;
+                        }
+                        count
+                    })
+                }).collect();
+                
+                let total: u64 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+                black_box(total)
+            })
+        });
+    }
+    
+    group.finish();
+}
+
+/// Benchmark concurrent hierarchical tracker operations
+fn bench_concurrent_hierarchical(c: &mut Criterion) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
+
+    let mut group = c.benchmark_group("concurrent/hierarchical");
+    
+    for threads in [1, 2, 4, 8] {
+        // Concurrent add_pair operations
+        group.bench_with_input(BenchmarkId::new("add_pair", threads), &threads, |b, &threads| {
+            b.iter_custom(|iters| {
+                let tracker = Arc::new(PrefixTracker::new(
+                    TrackerConfig::hierarchical("hash:")
+                        .with_max_id(10000)
+                        .with_max_sub_id(100)
+                ));
+                let counter = Arc::new(AtomicU64::new(0));
+                
+                let start = std::time::Instant::now();
+                
+                let handles: Vec<_> = (0..threads).map(|_| {
+                    let tracker = tracker.clone();
+                    let counter = counter.clone();
+                    thread::spawn(move || {
+                        for _ in 0..iters {
+                            let n = counter.fetch_add(1, Ordering::Relaxed);
+                            let id = n % 10000;
+                            let sub_id = n % 100;
+                            black_box(tracker.add_pair(id, sub_id));
+                        }
+                    })
+                }).collect();
+                
+                for h in handles {
+                    h.join().unwrap();
+                }
+                
+                start.elapsed()
+            })
+        });
+        
+        // Concurrent claim_pair operations
+        group.bench_with_input(BenchmarkId::new("claim_pair", threads), &threads, |b, &threads| {
+            b.iter_custom(|iters| {
+                let tracker = Arc::new(PrefixTracker::new(
+                    TrackerConfig::hierarchical("hash:")
+                        .with_max_id(10000)
+                        .with_max_sub_id(100)
+                ));
+                let counter = Arc::new(AtomicU64::new(0));
+                
+                let start = std::time::Instant::now();
+                
+                let handles: Vec<_> = (0..threads).map(|_| {
+                    let tracker = tracker.clone();
+                    let counter = counter.clone();
+                    thread::spawn(move || {
+                        for _ in 0..iters {
+                            let n = counter.fetch_add(1, Ordering::Relaxed);
+                            let id = n % 10000;
+                            let sub_id = n % 100;
+                            black_box(tracker.claim_pair(id, sub_id));
                         }
                     })
                 }).collect();
@@ -596,6 +1126,12 @@ criterion_group!(
 criterion_group!(
     concurrent_benches,
     bench_concurrent_claims,
+    bench_concurrent_bitmap_set,
+    bench_concurrent_partition_iter,
+    bench_concurrent_write_iter,
+    bench_concurrent_tracker_ops,
+    bench_concurrent_group_ops,
+    bench_concurrent_hierarchical,
 );
 
 // =============================================================================
