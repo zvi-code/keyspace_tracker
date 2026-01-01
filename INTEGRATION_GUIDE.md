@@ -598,7 +598,59 @@ let removed = tracker.removed_count_since(&pre_workload);
 println!("Workload complete: +{} -{}", added, removed);
 ```
 
-### Use Case 8: Iterate Only Reference Set Members
+### Use Case 8: Concurrent Claim Workers with Shared Cursor
+
+**Scenario**: Multiple workers atomically claim unique IDs without coordination, using `continue_write()`.
+
+When workers independently create iterators via `write()`, each call resets the cursor to 0, causing duplicate claims. Use `continue_write()` to share cursor state across workers:
+
+```rust
+use std::sync::Arc;
+use std::thread;
+
+let tracker = Arc::new(tracker);
+let num_workers = 8;
+let claims_per_worker = 1000;
+
+// Reset cursor once before spawning workers
+tracker.reset_write_cursor();
+
+let handles: Vec<_> = (0..num_workers)
+    .map(|_| {
+        let t = tracker.clone();
+        thread::spawn(move || {
+            let mut claimed = Vec::with_capacity(claims_per_worker);
+            
+            // continue_write() does NOT reset cursor - shares state across workers
+            let mut iter = t.iter().continue_write();
+            
+            for _ in 0..claims_per_worker {
+                if let Some((id, _)) = iter.next() {
+                    // ID is atomically claimed and set in bitmap
+                    valkey.hset(format!("vec:{}", id), "embedding", random_vector());
+                    claimed.push(id);
+                }
+            }
+            claimed
+        })
+    })
+    .collect();
+
+// All claimed IDs are unique - no duplicates across workers
+let all_claimed: Vec<u64> = handles.into_iter()
+    .flat_map(|h| h.join().unwrap())
+    .collect();
+    
+println!("Claimed {} unique IDs", all_claimed.len());
+```
+
+**Key difference:**
+| Method | Cursor Behavior | Use Case |
+|--------|-----------------|----------|
+| `write()` | Resets cursor to 0 | Single iterator, fresh start |
+| `continue_write()` | Keeps current position | Multiple workers sharing cursor |
+
+### Use Case 9: Iterate Only Reference Set Members
 
 **Scenario**: Run queries only on vectors that exist in both tracker and reference set.
 
@@ -670,6 +722,9 @@ impl PrefixTracker {
     pub fn remove_range(&self, start: u64, end: u64) -> u64;
     pub fn clear(&self);
     
+    // === Cursor Control ===
+    pub fn reset_write_cursor(&self);             // Reset to 0 before spawning workers
+    
     // === Snapshot & Diff ===
     pub fn snapshot(&self) -> BitmapSnapshot;
     pub fn added_since(&self, snapshot: &BitmapSnapshot) -> Vec<u64>;
@@ -723,7 +778,13 @@ impl<'a> TrackerIterBuilder<'a> {
     // === Terminal Operations ===
     pub fn sequential(self) -> SequentialIter<'a>;
     pub fn random(self) -> RandomIter<'a>;
-    pub fn claim(self) -> ClaimIter<'a>;
+    
+    /// Build write iterator (resets cursor to 0).
+    pub fn write(self) -> WriteIter<'a>;
+    
+    /// Build write iterator (continues from current cursor position).
+    /// Use when multiple workers share cursor state.
+    pub fn continue_write(self) -> WriteIter<'a>;
 }
 ```
 

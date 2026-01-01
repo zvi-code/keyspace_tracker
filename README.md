@@ -290,6 +290,49 @@ while let Some((id, _)) = writer.next() {
 // All IDs in `claimed` are now set and unique
 ```
 
+#### Concurrent Workers with `continue_write()`
+
+When multiple workers need to share cursor state across independently-created iterators,
+use `continue_write()` instead of `write()`:
+
+```rust
+use std::sync::Arc;
+use std::thread;
+
+let tracker = Arc::new(tracker);
+
+// Reset cursor once before spawning workers
+tracker.reset_write_cursor();
+
+let handles: Vec<_> = (0..8)
+    .map(|_| {
+        let t = tracker.clone();
+        thread::spawn(move || {
+            // continue_write() does NOT reset cursor - shares state across workers
+            let mut iter = t.iter().continue_write();
+            let mut claimed = Vec::new();
+            
+            for _ in 0..100 {
+                if let Some((id, _)) = iter.next() {
+                    claimed.push(id);
+                }
+            }
+            claimed
+        })
+    })
+    .collect();
+
+// All claimed IDs are unique - no duplicates across workers
+let all_claimed: Vec<u64> = handles.into_iter()
+    .flat_map(|h| h.join().unwrap())
+    .collect();
+```
+
+| Method | Cursor Behavior | Use Case |
+|--------|-----------------|----------|
+| `write()` | Resets cursor to 0 | Single iterator, fresh start |
+| `continue_write()` | Keeps current position | Multiple workers sharing cursor |
+
 ### Delete Iterator
 
 Exclusive iterator that clears IDs:

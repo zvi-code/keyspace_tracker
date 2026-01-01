@@ -564,8 +564,22 @@ impl PrefixTracker {
         &self.write_cursor
     }
 
-    /// Reset write cursor (call before starting iteration).
-    pub(crate) fn reset_write_cursor(&self) {
+    /// Reset the write cursor to position 0.
+    ///
+    /// Call this once before spawning concurrent workers that use
+    /// [`continue_write()`](crate::iterators::TrackerIterBuilder::continue_write).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use keyspace_tracker::PrefixTracker;
+    ///
+    /// let tracker = PrefixTracker::new(100);
+    /// tracker.reset_write_cursor(); // Reset once
+    ///
+    /// // Spawn workers that call tracker.iter().continue_write()
+    /// ```
+    pub fn reset_write_cursor(&self) {
         self.write_cursor.store(0, Ordering::Release);
     }
 

@@ -296,10 +296,48 @@ impl<'a> TrackerIterBuilder<'a> {
     ///
     /// Multiple `WriteIter`s can run concurrently. Each call to `next()`
     /// atomically claims a unique ID.
+    ///
+    /// **Note:** This resets the write cursor to 0 before iteration begins.
+    /// For concurrent scenarios where multiple iterators should share cursor
+    /// position, use [`continue_write()`](Self::continue_write) instead.
     pub fn write(self) -> WriteIter<'a> {
         // Reset cursor at start of iteration
         self.tracker.reset_write_cursor();
 
+        let max_id = self.range.id_max.min(self.tracker.effective_max_id());
+
+        WriteIter {
+            tracker: self.tracker,
+            range: self.range,
+            filter: self.filter,
+            max_id,
+        }
+    }
+
+    /// Build a write iterator that continues from the current cursor position.
+    ///
+    /// Unlike [`write()`](Self::write), this does **not** reset the write cursor.
+    /// Use this when multiple workers need to share cursor state across
+    /// independently-created iterators.
+    ///
+    /// # Example: Concurrent workers
+    ///
+    /// ```
+    /// use keyspace_tracker::PrefixTracker;
+    ///
+    /// let tracker = PrefixTracker::new(100);
+    /// tracker.reset_write_cursor(); // Reset once at the start
+    ///
+    /// // Multiple workers can create iterators without resetting cursor
+    /// let mut iter1 = tracker.iter().continue_write();
+    /// let mut iter2 = tracker.iter().continue_write();
+    ///
+    /// // Each claim_next_id() atomically advances the shared cursor
+    /// let id1 = iter1.claim_next_id();
+    /// let id2 = iter2.claim_next_id();
+    /// assert_ne!(id1, id2); // Different IDs guaranteed
+    /// ```
+    pub fn continue_write(self) -> WriteIter<'a> {
         let max_id = self.range.id_max.min(self.tracker.effective_max_id());
 
         WriteIter {
@@ -1709,5 +1747,88 @@ mod tests {
 
         let total: u64 = handles.into_iter().map(|h: thread::JoinHandle<u64>| h.join().unwrap()).sum();
         assert_eq!(total, 10000);
+    }
+
+    #[test]
+    fn test_continue_write_multithreaded() {
+        use std::collections::HashSet;
+        use std::sync::Arc;
+        use std::thread;
+
+        let tracker = Arc::new(PrefixTracker::new(
+            TrackerConfig::simple("vec:").with_max_id(10000),
+        ));
+
+        // Reset cursor once before spawning workers
+        tracker.reset_write_cursor();
+
+        let num_workers = 8;
+        let claims_per_worker = 100;
+
+        let handles: Vec<_> = (0..num_workers)
+            .map(|_| {
+                let t = tracker.clone();
+                thread::spawn(move || {
+                    let mut claimed = Vec::with_capacity(claims_per_worker);
+                    let mut iter = t.iter().continue_write();
+
+                    for _ in 0..claims_per_worker {
+                        if let Some((id, _sub_id)) = iter.next() {
+                            claimed.push(id);
+                        }
+                    }
+                    claimed
+                })
+            })
+            .collect();
+
+        // Collect all claimed IDs
+        let all_claimed: Vec<u64> = handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect();
+
+        // Verify no duplicates - each ID should be claimed exactly once
+        let unique: HashSet<_> = all_claimed.iter().collect();
+        assert_eq!(
+            unique.len(),
+            all_claimed.len(),
+            "Duplicate IDs claimed! Got {} claims but only {} unique",
+            all_claimed.len(),
+            unique.len()
+        );
+
+        // Should have claimed exactly num_workers * claims_per_worker IDs
+        assert_eq!(all_claimed.len(), num_workers * claims_per_worker);
+    }
+
+    #[test]
+    fn test_continue_write_vs_write_cursor_behavior() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(100));
+
+        // First write() resets cursor to 0
+        let mut iter1 = tracker.iter().write();
+        let (id1, _) = iter1.next().unwrap();
+        assert_eq!(id1, 0);
+
+        // Second write() also resets cursor to 0 - gets same ID!
+        let mut iter2 = tracker.iter().write();
+        let (id2, _) = iter2.next().unwrap();
+        assert_eq!(id2, 0, "write() should reset cursor");
+
+        // Now use continue_write() - manually reset first
+        tracker.reset_write_cursor();
+        let mut iter3 = tracker.iter().continue_write();
+        let (id3, _) = iter3.next().unwrap();
+        assert_eq!(id3, 0);
+
+        // continue_write() does NOT reset - continues from cursor
+        let mut iter4 = tracker.iter().continue_write();
+        let (id4, _) = iter4.next().unwrap();
+        assert_eq!(id4, 1, "continue_write() should NOT reset cursor");
+
+        let mut iter5 = tracker.iter().continue_write();
+        let (id5, _) = iter5.next().unwrap();
+        assert_eq!(id5, 2, "continue_write() should continue advancing");
     }
 }
