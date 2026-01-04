@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use super::config::{BitFilter, ClaimPolicy, IdRange, IterOrder, PrefixFilter, PrefixWeight};
+use super::config::{BitFilter, ClaimPolicy, FilterContext, IdRange, IterOrder, PrefixFilter, PrefixWeight, SamplingConfig};
 use super::tracker::PrefixTracker;
 
 /// Item yielded by group iterators.
@@ -138,10 +138,9 @@ impl<'a> GroupIterBuilder<'a> {
         GroupIter {
             trackers,
             range: self.range,
-            bit_filter: self.bit_filter,
+            ctx: FilterContext::new(self.bit_filter, SamplingConfig::new()),
             order: self.order,
             weight: self.weight,
-            rng: fastrand::Rng::new(),
             prefix_index: 0,
             current_id: self.range.id_min,
             current_sub_id: self.range.sub_id_min,
@@ -205,7 +204,7 @@ impl<'a> GroupIterBuilder<'a> {
                         sub_id_min: self.range.sub_id_min,
                         sub_id_max: self.range.sub_id_max,
                     },
-                    bit_filter: self.bit_filter,
+                    ctx: FilterContext::new(self.bit_filter, SamplingConfig::new()),
                     prefix_index: 0,
                     current_id: start,
                     current_sub_id: self.range.sub_id_min,
@@ -248,7 +247,7 @@ impl<'a> GroupIterBuilder<'a> {
                 sub_id_min: self.range.sub_id_min,
                 sub_id_max: self.range.sub_id_max,
             },
-            bit_filter: self.bit_filter,
+            ctx: FilterContext::new(self.bit_filter, SamplingConfig::new()),
             prefix_index: 0,
             current_id: start,
             current_sub_id: self.range.sub_id_min,
@@ -264,10 +263,9 @@ impl<'a> GroupIterBuilder<'a> {
 pub struct GroupIter {
     trackers: Vec<Arc<PrefixTracker>>,
     range: IdRange,
-    bit_filter: BitFilter,
+    ctx: FilterContext,
     order: IterOrder,
     weight: PrefixWeight,
-    rng: fastrand::Rng,
     prefix_index: usize,
     current_id: u64,
     current_sub_id: u64,
@@ -284,65 +282,37 @@ impl GroupIter {
                 let id = self.current_id;
 
                 if tracker.is_hierarchical() {
-                    // Use per-id max based on sub_bitmap capacity
                     let max_sub_id = self.range.sub_id_max.min(tracker.effective_max_sub_id_for(id));
 
                     while self.current_sub_id < max_sub_id {
                         let sub_id = self.current_sub_id;
                         self.current_sub_id += 1;
-
-                        if !self.range.contains(id, sub_id) {
-                            continue;
-                        }
-
-                        let is_set = tracker.exists_pair(id, sub_id);
-                        if self.matches_filter(is_set) {
-                            return Some(GroupItem {
-                                prefix: tracker.prefix().into(),
-                                id,
-                                sub_id: Some(sub_id),
-                            });
+                        if !self.range.contains(id, sub_id) { continue; }
+                        if self.ctx.should_yield(tracker.exists_pair(id, sub_id)) {
+                            return Some(GroupItem { prefix: tracker.prefix().into(), id, sub_id: Some(sub_id) });
                         }
                     }
-
                     self.current_id += 1;
                     self.current_sub_id = self.range.sub_id_min;
                 } else {
                     self.current_id += 1;
-
-                    if !self.range.contains_id(id) {
-                        continue;
-                    }
-
-                    let is_set = tracker.exists(id);
-                    if self.matches_filter(is_set) {
-                        return Some(GroupItem {
-                            prefix: tracker.prefix().into(),
-                            id,
-                            sub_id: None,
-                        });
+                    if !self.range.contains_id(id) { continue; }
+                    if self.ctx.should_yield(tracker.exists(id)) {
+                        return Some(GroupItem { prefix: tracker.prefix().into(), id, sub_id: None });
                     }
                 }
             }
-
-            // Move to next prefix
             self.prefix_index += 1;
             self.current_id = self.range.id_min;
             self.current_sub_id = self.range.sub_id_min;
         }
-
         None
     }
 
     fn next_vertical(&mut self) -> Option<GroupItem> {
-        if self.trackers.is_empty() {
-            return None;
-        }
+        if self.trackers.is_empty() { return None; }
 
-        // Find max ID across all trackers
-        let max_id = self
-            .trackers
-            .iter()
+        let max_id = self.trackers.iter()
             .map(|t| self.range.id_max.min(t.effective_max_id()))
             .max()
             .unwrap_or(0);
@@ -352,94 +322,52 @@ impl GroupIter {
                 let tracker = &self.trackers[self.prefix_index];
                 self.prefix_index += 1;
 
-                let tracker_max_id = self.range.id_max.min(tracker.effective_max_id());
-                if self.current_id >= tracker_max_id {
-                    continue;
-                }
+                if self.current_id >= self.range.id_max.min(tracker.effective_max_id()) { continue; }
 
-                if tracker.is_hierarchical() {
-                    // For hierarchical in vertical mode, we return one sub_id at a time
-                    let is_set = tracker.exists_pair(self.current_id, self.current_sub_id);
-                    if self.matches_filter(is_set) {
-                        return Some(GroupItem {
-                            prefix: tracker.prefix().into(),
-                            id: self.current_id,
-                            sub_id: Some(self.current_sub_id),
-                        });
-                    }
+                let (id, sub_id) = (self.current_id, self.current_sub_id);
+                let is_set = if tracker.is_hierarchical() {
+                    tracker.exists_pair(id, sub_id)
                 } else {
-                    let is_set = tracker.exists(self.current_id);
-                    if self.matches_filter(is_set) {
-                        return Some(GroupItem {
-                            prefix: tracker.prefix().into(),
-                            id: self.current_id,
-                            sub_id: None,
-                        });
-                    }
+                    tracker.exists(id)
+                };
+
+                if self.ctx.should_yield(is_set) {
+                    let sub = if tracker.is_hierarchical() { Some(sub_id) } else { None };
+                    return Some(GroupItem { prefix: tracker.prefix().into(), id, sub_id: sub });
                 }
             }
-
-            // Move to next ID
             self.prefix_index = 0;
             self.current_id += 1;
         }
-
         None
     }
 
     fn next_random(&mut self) -> Option<GroupItem> {
-        if self.trackers.is_empty() || self.exhausted {
-            return None;
-        }
+        if self.trackers.is_empty() || self.exhausted { return None; }
 
-        // Cache range values to avoid borrow conflicts
-        let id_min = self.range.id_min;
-        let id_max = self.range.id_max;
-        let sub_id_min = self.range.sub_id_min;
-        let sub_id_max = self.range.sub_id_max;
+        let (id_min, id_max) = (self.range.id_min, self.range.id_max);
+        let (sub_id_min, sub_id_max) = (self.range.sub_id_min, self.range.sub_id_max);
 
-        // Simple random: pick random prefix, then random ID
-        let max_attempts = 1000;
-        for _ in 0..max_attempts {
+        for _ in 0..1000 {
             let tracker_idx = self.select_weighted_tracker_idx()?;
             let tracker = &self.trackers[tracker_idx];
 
             let max_id = id_max.min(tracker.effective_max_id());
-            if id_min >= max_id {
-                continue;
-            }
+            if id_min >= max_id { continue; }
 
-            let id = self.rng.u64(id_min..max_id);
+            let id = self.ctx.sample_index(max_id - id_min) + id_min;
 
             if tracker.is_hierarchical() {
-                // Use per-id max based on sub_bitmap capacity
                 let max_sub_id = sub_id_max.min(tracker.effective_max_sub_id_for(id));
-                if sub_id_min >= max_sub_id {
-                    continue;
+                if sub_id_min >= max_sub_id { continue; }
+                let sub_id = self.ctx.sample_index(max_sub_id - sub_id_min) + sub_id_min;
+                if self.ctx.should_yield(tracker.exists_pair(id, sub_id)) {
+                    return Some(GroupItem { prefix: tracker.prefix().into(), id, sub_id: Some(sub_id) });
                 }
-
-                let sub_id = self.rng.u64(sub_id_min..max_sub_id);
-                let is_set = tracker.exists_pair(id, sub_id);
-
-                if self.matches_filter(is_set) {
-                    return Some(GroupItem {
-                        prefix: tracker.prefix().into(),
-                        id,
-                        sub_id: Some(sub_id),
-                    });
-                }
-            } else {
-                let is_set = tracker.exists(id);
-                if self.matches_filter(is_set) {
-                    return Some(GroupItem {
-                        prefix: tracker.prefix().into(),
-                        id,
-                        sub_id: None,
-                    });
-                }
+            } else if self.ctx.should_yield(tracker.exists(id)) {
+                return Some(GroupItem { prefix: tracker.prefix().into(), id, sub_id: None });
             }
         }
-
         self.exhausted = true;
         None
     }
@@ -451,7 +379,7 @@ impl GroupIter {
 
         match self.weight {
             PrefixWeight::Uniform => {
-                let idx = self.rng.usize(..self.trackers.len());
+                let idx = self.ctx.sample_index(self.trackers.len() as u64) as usize;
                 Some(idx)
             }
             PrefixWeight::ByCapacity => {
@@ -477,11 +405,11 @@ impl GroupIter {
         let total: u64 = weights.iter().sum();
         if total == 0 {
             // Fallback to uniform
-            let idx = self.rng.usize(..self.trackers.len());
+            let idx = self.ctx.sample_index(self.trackers.len() as u64) as usize;
             return Some(idx);
         }
 
-        let mut pick = self.rng.u64(..total);
+        let mut pick = self.ctx.sample_index(total);
         for (i, &w) in weights.iter().enumerate() {
             if pick < w {
                 return Some(i);
@@ -490,15 +418,6 @@ impl GroupIter {
         }
 
         Some(self.trackers.len() - 1)
-    }
-
-    #[inline]
-    fn matches_filter(&self, is_set: bool) -> bool {
-        match self.bit_filter {
-            BitFilter::All => true,
-            BitFilter::Set => is_set,
-            BitFilter::Unset => !is_set,
-        }
     }
 }
 
@@ -751,51 +670,35 @@ impl GroupDeleteIter {
             return None;
         }
 
-        // For delete, we use sequential scanning (simpler than write)
         while self.prefix_index < self.trackers.len() {
             let tracker = &self.trackers[self.prefix_index];
             let max_id = self.range.id_max.min(tracker.effective_max_id());
 
             while self.current_id < max_id {
                 if tracker.is_hierarchical() {
-                    // Use per-id max based on sub_bitmap capacity
                     let max_sub_id = self.range.sub_id_max.min(tracker.effective_max_sub_id_for(self.current_id));
 
                     while self.current_sub_id < max_sub_id {
-                        let id = self.current_id;
-                        let sub_id = self.current_sub_id;
+                        let (id, sub_id) = (self.current_id, self.current_sub_id);
                         self.current_sub_id += 1;
-
                         if tracker.remove_pair(id, sub_id) {
-                            return Some(GroupItem {
-                                prefix: tracker.prefix().into(),
-                                id,
-                                sub_id: Some(sub_id),
-                            });
+                            return Some(GroupItem { prefix: tracker.prefix().into(), id, sub_id: Some(sub_id) });
                         }
                     }
-
                     self.current_id += 1;
                     self.current_sub_id = self.range.sub_id_min;
                 } else {
                     let id = self.current_id;
                     self.current_id += 1;
-
                     if tracker.remove(id) {
-                        return Some(GroupItem {
-                            prefix: tracker.prefix().into(),
-                            id,
-                            sub_id: None,
-                        });
+                        return Some(GroupItem { prefix: tracker.prefix().into(), id, sub_id: None });
                     }
                 }
             }
-
             self.prefix_index += 1;
             self.current_id = self.range.id_min;
             self.current_sub_id = self.range.sub_id_min;
         }
-
         None
     }
 }
@@ -816,7 +719,7 @@ impl Drop for GroupDeleteIter {
 pub struct GroupPartitionedIter {
     trackers: Vec<Arc<PrefixTracker>>,
     range: IdRange,
-    bit_filter: BitFilter,
+    ctx: FilterContext,
     prefix_index: usize,
     current_id: u64,
     current_sub_id: u64,
@@ -839,58 +742,29 @@ impl Iterator for GroupPartitionedIter {
 
             while self.current_id < max_id {
                 if tracker.is_hierarchical() {
-                    // Use per-id max based on sub_bitmap capacity
                     let max_sub_id = self.range.sub_id_max.min(tracker.effective_max_sub_id_for(self.current_id));
 
                     while self.current_sub_id < max_sub_id {
-                        let id = self.current_id;
-                        let sub_id = self.current_sub_id;
+                        let (id, sub_id) = (self.current_id, self.current_sub_id);
                         self.current_sub_id += 1;
-
-                        let is_set = tracker.exists_pair(id, sub_id);
-                        let matches = match self.bit_filter {
-                            BitFilter::All => true,
-                            BitFilter::Set => is_set,
-                            BitFilter::Unset => !is_set,
-                        };
-
-                        if matches {
-                            return Some(GroupItem {
-                                prefix: tracker.prefix().into(),
-                                id,
-                                sub_id: Some(sub_id),
-                            });
+                        if self.ctx.should_yield(tracker.exists_pair(id, sub_id)) {
+                            return Some(GroupItem { prefix: tracker.prefix().into(), id, sub_id: Some(sub_id) });
                         }
                     }
-
                     self.current_id += 1;
                     self.current_sub_id = self.range.sub_id_min;
                 } else {
                     let id = self.current_id;
                     self.current_id += 1;
-
-                    let is_set = tracker.exists(id);
-                    let matches = match self.bit_filter {
-                        BitFilter::All => true,
-                        BitFilter::Set => is_set,
-                        BitFilter::Unset => !is_set,
-                    };
-
-                    if matches {
-                        return Some(GroupItem {
-                            prefix: tracker.prefix().into(),
-                            id,
-                            sub_id: None,
-                        });
+                    if self.ctx.should_yield(tracker.exists(id)) {
+                        return Some(GroupItem { prefix: tracker.prefix().into(), id, sub_id: None });
                     }
                 }
             }
-
             self.prefix_index += 1;
             self.current_id = self.range.id_min;
             self.current_sub_id = self.range.sub_id_min;
         }
-
         None
     }
 }

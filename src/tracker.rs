@@ -148,8 +148,15 @@ impl PrefixTracker {
             None
         };
 
+        // Pre-allocate to max_id if specified, otherwise use initial_capacity.
+        // This avoids bitmap growth during concurrent operations.
+        let bitmap_capacity = config
+            .max_id
+            .map(|m| m as usize)
+            .unwrap_or(config.initial_capacity);
+
         Self {
-            primary_bitmap: AtomicBitmap::with_capacity(config.initial_capacity),
+            primary_bitmap: AtomicBitmap::with_capacity(bitmap_capacity),
             sub_bitmaps,
             hierarchical_count: AtomicU64::new(0),
             delete_iter_active: AtomicBool::new(false),
@@ -506,10 +513,13 @@ impl PrefixTracker {
         self.count() == 0
     }
 
-    /// Ensure capacity for the given ID.
+    /// Check if the given ID is within the tracker's capacity.
+    ///
+    /// Since the bitmap has a fixed size (determined by `max_id` at construction),
+    /// this method verifies that the ID can be stored without panicking.
     #[inline]
-    pub fn ensure_capacity(&self, id: u64) {
-        self.primary_bitmap.ensure_capacity(id as usize);
+    pub fn has_capacity_for(&self, id: u64) -> bool {
+        (id as usize) < self.primary_bitmap.capacity()
     }
 
     /// Clear all tracked IDs.
@@ -989,7 +999,9 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let tracker = Arc::new(PrefixTracker::simple("vec:"));
+        let tracker = Arc::new(PrefixTracker::new(
+            TrackerConfig::simple("vec:").with_max_id(8000),
+        ));
 
         let handles: Vec<_> = (0..8)
             .map(|t| {
@@ -1015,7 +1027,9 @@ mod tests {
         use std::sync::Arc;
         use std::thread;
 
-        let tracker = Arc::new(PrefixTracker::simple("vec:"));
+        let tracker = Arc::new(PrefixTracker::new(
+            TrackerConfig::simple("vec:").with_max_id(1000),
+        ));
         let success_count = Arc::new(AtomicU64::new(0));
 
         let handles: Vec<_> = (0..8)

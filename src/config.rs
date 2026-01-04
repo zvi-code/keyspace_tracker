@@ -198,6 +198,169 @@ impl Default for SamplingConfig {
 }
 
 // ============================================================================
+// Filter Context - Consolidated filter/sampling logic
+// ============================================================================
+
+/// Encapsulates filter and sampling state for consistent behavior across iterators.
+///
+/// This consolidates the `check_limit()`, `matches_filter()`, and `passes_sampling()`
+/// logic that is common to `SequentialIter`, `RandomIter`, `PartitionedIter`, etc.
+///
+/// # Example
+///
+/// ```ignore
+/// let mut ctx = FilterContext::new(BitFilter::Set, sampling_config);
+/// 
+/// // In iteration loop:
+/// if !ctx.check_limit() { return None; }
+/// if !ctx.matches_filter(is_set) { continue; }
+/// if !ctx.passes_sampling() { continue; }
+/// ctx.record_yield();
+/// ```
+#[derive(Clone)]
+pub struct FilterContext {
+    filter: BitFilter,
+    sampling: SamplingConfig,
+    rng: fastrand::Rng,
+    yielded: u64,
+}
+
+impl FilterContext {
+    /// Create a new filter context.
+    #[inline]
+    pub fn new(filter: BitFilter, sampling: SamplingConfig) -> Self {
+        let rng = sampling.make_rng();
+        Self {
+            filter,
+            sampling,
+            rng,
+            yielded: 0,
+        }
+    }
+
+    /// Check if we should continue iterating (respects limit).
+    #[inline]
+    pub fn check_limit(&self) -> bool {
+        match self.sampling.limit {
+            Some(limit) => self.yielded < limit,
+            None => true,
+        }
+    }
+
+    /// Check if item matches filter (with mixed-ratio support).
+    #[inline]
+    pub fn matches_filter(&mut self, is_set: bool) -> bool {
+        if let Some(set_ratio) = self.sampling.set_ratio {
+            // Mixed-ratio mode: probabilistically select based on ratio
+            let want_set = self.rng.f64() < set_ratio;
+            want_set == is_set
+        } else {
+            // Standard filter mode
+            match self.filter {
+                BitFilter::All => true,
+                BitFilter::Set => is_set,
+                BitFilter::Unset => !is_set,
+            }
+        }
+    }
+
+    /// Check probabilistic sampling.
+    #[inline]
+    pub fn passes_sampling(&mut self) -> bool {
+        if self.sampling.sample_probability < 1.0 {
+            self.rng.f64() < self.sampling.sample_probability
+        } else {
+            true
+        }
+    }
+
+    /// Record that an item was yielded. Call after successfully returning an item.
+    #[inline]
+    pub fn record_yield(&mut self) {
+        self.yielded += 1;
+    }
+
+    /// Get current yield count.
+    #[inline]
+    pub fn yielded(&self) -> u64 {
+        self.yielded
+    }
+
+    /// Sample an index using configured distribution.
+    #[inline]
+    pub fn sample_index(&mut self, range_size: u64) -> u64 {
+        self.sampling.distribution.sample(&mut self.rng, range_size)
+    }
+
+    /// Get a random f64 in [0, 1).
+    #[inline]
+    pub fn random_f64(&mut self) -> f64 {
+        self.rng.f64()
+    }
+
+    /// Check if using non-uniform distribution.
+    #[inline]
+    pub fn has_distribution(&self) -> bool {
+        self.sampling.has_distribution()
+    }
+
+    /// Check if we can use SIMD-accelerated `find_next_set` for iteration.
+    /// 
+    /// Returns true when filter is `Set` with no mixed-ratio sampling,
+    /// enabling O(density) iteration instead of O(n).
+    #[inline]
+    pub fn can_use_find_next_set(&self) -> bool {
+        self.filter == BitFilter::Set 
+            && self.sampling.set_ratio.is_none()
+            && self.sampling.sample_probability >= 1.0
+    }
+
+    /// Check if we can use SIMD-accelerated `find_next_unset` for iteration.
+    #[inline]
+    pub fn can_use_find_next_unset(&self) -> bool {
+        self.filter == BitFilter::Unset 
+            && self.sampling.set_ratio.is_none()
+            && self.sampling.sample_probability >= 1.0
+    }
+
+    /// Get the filter type.
+    #[inline]
+    pub fn filter(&self) -> BitFilter {
+        self.filter
+    }
+
+    /// Combined check: filter + sampling + limit, then record yield if passed.
+    /// 
+    /// Returns true if the item should be yielded. Automatically records the yield.
+    /// Use this to simplify the common iteration pattern:
+    /// 
+    /// ```ignore
+    /// // Before: 4 separate calls
+    /// if !ctx.check_limit() { return None; }
+    /// if !ctx.matches_filter(is_set) { continue; }
+    /// if !ctx.passes_sampling() { continue; }
+    /// ctx.record_yield();
+    /// 
+    /// // After: single call
+    /// if !ctx.should_yield(is_set) { continue; }
+    /// ```
+    #[inline]
+    pub fn should_yield(&mut self, is_set: bool) -> bool {
+        if !self.check_limit() { return false; }
+        if !self.matches_filter(is_set) { return false; }
+        if !self.passes_sampling() { return false; }
+        self.record_yield();
+        true
+    }
+}
+
+impl Default for FilterContext {
+    fn default() -> Self {
+        Self::new(BitFilter::All, SamplingConfig::new())
+    }
+}
+
+// ============================================================================
 // Access Distribution Patterns
 // ============================================================================
 
@@ -1453,6 +1616,77 @@ impl IdRange {
 impl Default for IdRange {
     fn default() -> Self {
         Self::unbounded()
+    }
+}
+
+// ============================================================================
+// Iteration Cursor
+// ============================================================================
+
+/// Cursor for iterating over (id, sub_id) pairs within a range.
+///
+/// Unifies the common pattern of iterating through IDs, handling both
+/// simple (id-only) and hierarchical (id, sub_id) cases.
+#[derive(Clone, Debug)]
+pub struct IdCursor {
+    /// Current primary ID position.
+    pub id: u64,
+    /// Current sub_id position (for hierarchical iteration).
+    pub sub_id: u64,
+    /// Minimum sub_id to reset to when advancing id.
+    pub sub_id_min: u64,
+}
+
+impl IdCursor {
+    /// Create a new cursor starting at the given range minimum.
+    #[inline]
+    pub fn new(range: &IdRange) -> Self {
+        Self {
+            id: range.id_min,
+            sub_id: range.sub_id_min,
+            sub_id_min: range.sub_id_min,
+        }
+    }
+
+    /// Advance to next sub_id, wrapping to next id when sub_id_max reached.
+    /// Returns true if advanced within bounds, false if exhausted.
+    #[inline]
+    pub fn advance_sub(&mut self, sub_id_max: u64, id_max: u64) -> bool {
+        self.sub_id += 1;
+        if self.sub_id >= sub_id_max {
+            self.sub_id = self.sub_id_min;
+            self.id += 1;
+        }
+        self.id < id_max
+    }
+
+    /// Advance to next id (simple mode).
+    /// Returns true if within bounds, false if exhausted.
+    #[inline]
+    pub fn advance_id(&mut self, id_max: u64) -> bool {
+        self.id += 1;
+        self.id < id_max
+    }
+
+    /// Get current position as (id, sub_id).
+    #[inline]
+    pub fn position(&self) -> (u64, u64) {
+        (self.id, self.sub_id)
+    }
+
+    /// Reset to start of range.
+    #[inline]
+    pub fn reset(&mut self, range: &IdRange) {
+        self.id = range.id_min;
+        self.sub_id = range.sub_id_min;
+        self.sub_id_min = range.sub_id_min;
+    }
+
+    /// Move directly to a position.
+    #[inline]
+    pub fn seek(&mut self, id: u64, sub_id: u64) {
+        self.id = id;
+        self.sub_id = sub_id;
     }
 }
 

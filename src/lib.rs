@@ -234,8 +234,8 @@ pub use bitmap::ArmCapabilities;
 pub use bitmap::X86Capabilities;
 pub use bitmap::print_cpu_capabilities;
 pub use config::{
-    AccessDistribution, BitmapSnapshot, BitFilter, ClaimPolicy, FragmentationPattern, IdRange,
-    IterOrder, PrefixFilter, PrefixWeight, ReferenceSet, SamplingConfig, TrackerConfig,
+    AccessDistribution, BitmapSnapshot, BitFilter, ClaimPolicy, FilterContext, FragmentationPattern,
+    IdCursor, IdRange, IterOrder, PrefixFilter, PrefixWeight, ReferenceSet, SamplingConfig, TrackerConfig,
     WorkloadOperation, WorkloadProfile,
 };
 pub use group_iter::{

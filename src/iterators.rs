@@ -10,7 +10,7 @@
 
 use std::sync::atomic::Ordering;
 
-use super::config::{BitFilter, IdRange, SamplingConfig};
+use super::config::{BitFilter, FilterContext, IdRange, SamplingConfig};
 use super::tracker::PrefixTracker;
 
 /// Item yielded by tracker iterators.
@@ -160,12 +160,6 @@ impl<'a> TrackerIterBuilder<'a> {
         self
     }
 
-    /// Check if sampling is configured.
-    #[inline]
-    fn has_sampling(&self) -> bool {
-        self.sampling.has_sampling()
-    }
-
     /// Build a sequential (ascending order) iterator.
     pub fn sequential(self) -> SequentialIter<'a> {
         let max_id = self.range.id_max.min(self.tracker.effective_max_id());
@@ -173,13 +167,10 @@ impl<'a> TrackerIterBuilder<'a> {
         SequentialIter {
             tracker: self.tracker,
             range: self.range,
-            filter: self.filter,
-            sampling: self.sampling,
+            ctx: FilterContext::new(self.filter, self.sampling),
             current_id: self.range.id_min,
             current_sub_id: self.range.sub_id_min,
             max_id,
-            rng: self.sampling.make_rng(),
-            yielded: 0,
             wrap_around: false,
         }
     }
@@ -202,15 +193,12 @@ impl<'a> TrackerIterBuilder<'a> {
         RandomIter {
             tracker: self.tracker,
             range: self.range,
-            filter: self.filter,
-            sampling: self.sampling,
+            ctx: FilterContext::new(self.filter, self.sampling),
             range_size,
             multiplier,
             offset,
             current_step: 0,
             max_steps: range_size,
-            rng,
-            yielded: 0,
         }
     }
 
@@ -414,20 +402,19 @@ impl<'a> TrackerIterBuilder<'a> {
                     partition_sampling.seed = Some(seed.wrapping_add(i as u64));
                 }
 
+                let range = IdRange {
+                    id_min: start,
+                    id_max: end,
+                    sub_id_min: self.range.sub_id_min,
+                    sub_id_max: self.range.sub_id_max,
+                };
+
                 PartitionedIter {
                     tracker: self.tracker,
-                    range: IdRange {
-                        id_min: start,
-                        id_max: end,
-                        sub_id_min: self.range.sub_id_min,
-                        sub_id_max: self.range.sub_id_max,
-                    },
-                    filter: self.filter,
-                    sampling: partition_sampling,
+                    range,
+                    ctx: FilterContext::new(self.filter, partition_sampling),
                     current_id: start,
                     current_sub_id: self.range.sub_id_min,
-                    rng: partition_sampling.make_rng(),
-                    yielded: 0,
                 }
             })
             .collect()
@@ -519,20 +506,19 @@ impl<'a> TrackerIterBuilder<'a> {
             partition_sampling.seed = Some(seed.wrapping_add(index as u64));
         }
 
+        let range = IdRange {
+            id_min: start,
+            id_max: end,
+            sub_id_min: self.range.sub_id_min,
+            sub_id_max: self.range.sub_id_max,
+        };
+
         PartitionedIter {
             tracker: self.tracker,
-            range: IdRange {
-                id_min: start,
-                id_max: end,
-                sub_id_min: self.range.sub_id_min,
-                sub_id_max: self.range.sub_id_max,
-            },
-            filter: self.filter,
-            sampling: partition_sampling,
+            range,
+            ctx: FilterContext::new(self.filter, partition_sampling),
             current_id: start,
             current_sub_id: self.range.sub_id_min,
-            rng: partition_sampling.make_rng(),
-            yielded: 0,
         }
     }
 }
@@ -548,13 +534,10 @@ impl<'a> TrackerIterBuilder<'a> {
 pub struct SequentialIter<'a> {
     tracker: &'a PrefixTracker,
     range: IdRange,
-    filter: BitFilter,
-    sampling: SamplingConfig,
+    ctx: FilterContext,
     current_id: u64,
     current_sub_id: u64,
     max_id: u64,
-    rng: fastrand::Rng,
-    yielded: u64,
     wrap_around: bool,
 }
 
@@ -586,89 +569,66 @@ impl<'a> SequentialIter<'a> {
         self
     }
 
-    /// Check if we should continue iterating (respects limit).
-    #[inline]
-    fn check_limit(&self) -> bool {
-        if let Some(limit) = self.sampling.limit {
-            self.yielded < limit
-        } else {
-            true
-        }
-    }
-
-    /// Check if item matches filter (with mixed-ratio support).
-    #[inline]
-    fn matches_filter(&mut self, is_set: bool) -> bool {
-        if let Some(set_ratio) = self.sampling.set_ratio {
-            // Mixed-ratio mode
-            let want_set = self.rng.f64() < set_ratio;
-            want_set == is_set
-        } else {
-            match self.filter {
-                BitFilter::All => true,
-                BitFilter::Set => is_set,
-                BitFilter::Unset => !is_set,
-            }
-        }
-    }
-
-    /// Check probabilistic sampling.
-    #[inline]
-    fn passes_sampling(&mut self) -> bool {
-        if self.sampling.sample_probability < 1.0 {
-            self.rng.f64() < self.sampling.sample_probability
-        } else {
-            true
-        }
-    }
-
     /// Get next ID for simple (non-hierarchical) trackers.
     fn next_simple(&mut self) -> Option<TrackerItem> {
-        if !self.check_limit() {
-            return None;
-        }
-
         let bitmap = self.tracker.primary_bitmap();
 
+        // SIMD fast path: set_only without sampling
+        if self.ctx.can_use_find_next_set() {
+            loop {
+                if !self.ctx.check_limit() { return None; }
+                if self.current_id >= self.max_id {
+                    if self.wrap_around { self.current_id = self.range.id_min; continue; }
+                    return None;
+                }
+                if let Some(id) = bitmap.find_next_set(self.current_id as usize).filter(|&id| (id as u64) < self.max_id) {
+                    self.current_id = id as u64 + 1;
+                    self.ctx.record_yield();
+                    return Some((id as u64, None));
+                }
+                if self.wrap_around { self.current_id = self.range.id_min; continue; }
+                return None;
+            }
+        }
+
+        // SIMD fast path: unset_only without sampling
+        if self.ctx.can_use_find_next_unset() {
+            loop {
+                if !self.ctx.check_limit() { return None; }
+                if self.current_id >= self.max_id {
+                    if self.wrap_around { self.current_id = self.range.id_min; continue; }
+                    return None;
+                }
+                if let Some(id) = bitmap.find_next_unset(self.current_id as usize, self.max_id as usize) {
+                    self.current_id = id as u64 + 1;
+                    self.ctx.record_yield();
+                    return Some((id as u64, None));
+                }
+                if self.wrap_around { self.current_id = self.range.id_min; continue; }
+                return None;
+            }
+        }
+
+        // Standard path
         loop {
             while self.current_id < self.max_id {
                 let id = self.current_id;
                 self.current_id += 1;
-
-                let is_set = bitmap.test(id as usize);
-
-                if !self.matches_filter(is_set) {
-                    continue;
+                if self.ctx.should_yield(bitmap.test(id as usize)) {
+                    return Some((id, None));
                 }
-
-                if !self.passes_sampling() {
-                    continue;
-                }
-
-                self.yielded += 1;
-                return Some((id, None));
             }
-
-            // Reached end of range
-            if self.wrap_around {
-                // Reset to beginning for next cycle
-                self.current_id = self.range.id_min;
-                continue;
-            }
+            if self.wrap_around { self.current_id = self.range.id_min; continue; }
             return None;
         }
     }
 
     /// Get next (id, sub_id) for hierarchical trackers.
     fn next_hierarchical(&mut self) -> Option<TrackerItem> {
-        if !self.check_limit() {
-            return None;
-        }
-
         let sub_bitmaps = self.tracker.sub_bitmaps()?;
+        let max_sub_base = self.range.sub_id_max.min(self.tracker.effective_max_sub_id());
 
         loop {
-            // Check if we've exhausted all primary IDs
             if self.current_id >= self.max_id {
                 if self.wrap_around {
                     self.current_id = self.range.id_min;
@@ -678,45 +638,18 @@ impl<'a> SequentialIter<'a> {
                 return None;
             }
 
-            // Check if current primary ID has a sub-bitmap
             if let Some(sub_bitmap) = sub_bitmaps.get(&self.current_id) {
-                // Use actual bitmap capacity, clamped by range
-                let bitmap_cap = sub_bitmap.capacity() as u64;
-                let max_sub_id = self
-                    .range
-                    .sub_id_max
-                    .min(self.tracker.effective_max_sub_id())
-                    .min(bitmap_cap);
+                let max_sub_id = max_sub_base.min(sub_bitmap.capacity() as u64);
 
                 while self.current_sub_id < max_sub_id {
                     let sub_id = self.current_sub_id;
                     self.current_sub_id += 1;
-
-                    if sub_id < self.range.sub_id_min {
-                        continue;
+                    if sub_id < self.range.sub_id_min { continue; }
+                    if self.ctx.should_yield(sub_bitmap.test(sub_id as usize)) {
+                        return Some((self.current_id, Some(sub_id)));
                     }
-
-                    let is_set = sub_bitmap.test(sub_id as usize);
-
-                    if !self.matches_filter(is_set) {
-                        continue;
-                    }
-
-                    if !self.passes_sampling() {
-                        continue;
-                    }
-
-                    // Re-check limit after potential skip
-                    if !self.check_limit() {
-                        return None;
-                    }
-
-                    self.yielded += 1;
-                    return Some((self.current_id, Some(sub_id)));
                 }
             }
-
-            // Move to next primary ID
             self.current_id += 1;
             self.current_sub_id = self.range.sub_id_min;
         }
@@ -749,33 +682,27 @@ impl Iterator for SequentialIter<'_> {
 pub struct RandomIter<'a> {
     tracker: &'a PrefixTracker,
     range: IdRange,
-    filter: BitFilter,
-    sampling: SamplingConfig,
+    ctx: FilterContext,
     range_size: u64,
     multiplier: u64,
     offset: u64,
     current_step: u64,
     max_steps: u64,
-    rng: fastrand::Rng,
-    yielded: u64,
 }
 
 impl<'a> RandomIter<'a> {
     fn next_index(&mut self) -> Option<u64> {
-        // Check limit
-        if let Some(limit) = self.sampling.limit {
-            if self.yielded >= limit {
-                return None;
-            }
+        if !self.ctx.check_limit() {
+            return None;
         }
 
         while self.current_step < self.max_steps {
             self.current_step += 1;
 
             // Select index based on distribution
-            let index = if self.sampling.has_distribution() {
+            let index = if self.ctx.has_distribution() {
                 // Use configured distribution (Zipfian, Exponential, etc.)
-                self.sampling.sample_index(&mut self.rng, self.range_size)
+                self.ctx.sample_index(self.range_size)
             } else {
                 // Use multiplicative permutation for uniform coverage
                 if self.range_size > 0 {
@@ -796,32 +723,15 @@ impl<'a> RandomIter<'a> {
 
             let is_set = self.tracker.primary_bitmap().test(id as usize);
 
-            // Apply filter logic (with mixed-ratio support)
-            let matches = if let Some(set_ratio) = self.sampling.set_ratio {
-                // Mixed-ratio mode: probabilistically select set vs unset
-                let want_set = self.rng.f64() < set_ratio;
-                want_set == is_set
-            } else {
-                // Standard filter mode
-                match self.filter {
-                    BitFilter::All => true,
-                    BitFilter::Set => is_set,
-                    BitFilter::Unset => !is_set,
-                }
-            };
-
-            if !matches {
+            if !self.ctx.matches_filter(is_set) {
                 continue;
             }
 
-            // Apply probabilistic sampling
-            if self.sampling.sample_probability < 1.0 {
-                if self.rng.f64() >= self.sampling.sample_probability {
-                    continue;
-                }
+            if !self.ctx.passes_sampling() {
+                continue;
             }
 
-            self.yielded += 1;
+            self.ctx.record_yield();
             return Some(id);
         }
 
@@ -925,25 +835,31 @@ impl<'a> WriteIter<'a> {
                         return None;
                     }
 
-                    // Find next unset bit
-                    if let Some(id) = bitmap.find_next_unset(start as usize, self.max_id as usize) {
-                        let id = id as u64;
-                        if id < self.range.id_min {
-                            cursor.fetch_max(self.range.id_min, Ordering::AcqRel);
-                            continue;
-                        }
-
-                        // Try to claim it
-                        if bitmap.test_and_set(id as usize) {
-                            // Advance cursor past this bit
-                            cursor.fetch_max(id + 1, Ordering::AcqRel);
-                            return Some((id, None));
-                        }
-                        // Someone else claimed it, retry
+                    // Find next unset bit (within bitmap capacity)
+                    // If cursor is beyond capacity, all bits from cursor to max_id are unset
+                    let capacity = bitmap.capacity() as u64;
+                    let id = if start >= capacity {
+                        // Beyond bitmap capacity - bit is implicitly unset
+                        start
+                    } else if let Some(found) = bitmap.find_next_unset(start as usize, self.max_id as usize) {
+                        found as u64
+                    } else if capacity < self.max_id {
+                        // No unset bits in bitmap, but there are IDs beyond capacity
+                        capacity
                     } else {
                         // No more unset bits
                         if self.wrap_around {
-                            // Reset cursor and clear bitmap for next cycle
+                            bitmap.clear_range(self.range.id_min as usize, self.max_id as usize);
+                            cursor.store(self.range.id_min, Ordering::Release);
+                            continue;
+                        }
+                        cursor.store(self.max_id, Ordering::Release);
+                        return None;
+                    };
+
+                    // Bounds check (capacity can grow during iteration)
+                    if id >= self.max_id {
+                        if self.wrap_around {
                             bitmap.clear_range(self.range.id_min as usize, self.max_id as usize);
                             cursor.store(self.range.id_min, Ordering::Release);
                             continue;
@@ -951,6 +867,19 @@ impl<'a> WriteIter<'a> {
                         cursor.store(self.max_id, Ordering::Release);
                         return None;
                     }
+
+                    if id < self.range.id_min {
+                        cursor.fetch_max(self.range.id_min, Ordering::AcqRel);
+                        continue;
+                    }
+
+                    // Try to claim it
+                    if bitmap.test_and_set(id as usize) {
+                        // Advance cursor past this bit
+                        cursor.fetch_max(id + 1, Ordering::AcqRel);
+                        return Some((id, None));
+                    }
+                    // Someone else claimed it, retry
                 }
             }
             BitFilter::All => {
@@ -1137,12 +1066,9 @@ impl Drop for DeleteIter<'_> {
 pub struct PartitionedIter<'a> {
     tracker: &'a PrefixTracker,
     range: IdRange,
-    filter: BitFilter,
-    sampling: SamplingConfig,
+    ctx: FilterContext,
     current_id: u64,
     current_sub_id: u64,
-    rng: fastrand::Rng,
-    yielded: u64,
 }
 
 impl<'a> PartitionedIter<'a> {
@@ -1165,117 +1091,60 @@ impl Iterator for PartitionedIter<'_> {
 }
 
 impl<'a> PartitionedIter<'a> {
-    /// Check if we should continue iterating (respects limit).
-    #[inline]
-    fn check_limit(&self) -> bool {
-        if let Some(limit) = self.sampling.limit {
-            self.yielded < limit
-        } else {
-            true
-        }
-    }
-
-    /// Check if item matches filter (with mixed-ratio support).
-    #[inline]
-    fn matches_filter(&mut self, is_set: bool) -> bool {
-        if let Some(set_ratio) = self.sampling.set_ratio {
-            let want_set = self.rng.f64() < set_ratio;
-            want_set == is_set
-        } else {
-            match self.filter {
-                BitFilter::All => true,
-                BitFilter::Set => is_set,
-                BitFilter::Unset => !is_set,
-            }
-        }
-    }
-
-    /// Check probabilistic sampling.
-    #[inline]
-    fn passes_sampling(&mut self) -> bool {
-        if self.sampling.sample_probability < 1.0 {
-            self.rng.f64() < self.sampling.sample_probability
-        } else {
-            true
-        }
-    }
-
     fn next_simple(&mut self) -> Option<TrackerItem> {
-        if !self.check_limit() {
-            return None;
-        }
-
         let bitmap = self.tracker.primary_bitmap();
+        let max = self.range.id_max;
 
-        while self.current_id < self.range.id_max {
-            let id = self.current_id;
-            self.current_id += 1;
-
-            let is_set = bitmap.test(id as usize);
-
-            if !self.matches_filter(is_set) {
-                continue;
-            }
-
-            if !self.passes_sampling() {
-                continue;
-            }
-
-            self.yielded += 1;
+        // SIMD fast path: set_only without sampling
+        if self.ctx.can_use_find_next_set() {
+            if !self.ctx.check_limit() || self.current_id >= max { return None; }
+            let id = bitmap.find_next_set(self.current_id as usize)? as u64;
+            if id >= max { return None; }
+            self.current_id = id + 1;
+            self.ctx.record_yield();
             return Some((id, None));
         }
 
+        // SIMD fast path: unset_only without sampling
+        if self.ctx.can_use_find_next_unset() {
+            if !self.ctx.check_limit() || self.current_id >= max { return None; }
+            let id = bitmap.find_next_unset(self.current_id as usize, max as usize)? as u64;
+            self.current_id = id + 1;
+            self.ctx.record_yield();
+            return Some((id, None));
+        }
+
+        // Standard path
+        while self.current_id < max {
+            let id = self.current_id;
+            self.current_id += 1;
+            if self.ctx.should_yield(bitmap.test(id as usize)) {
+                return Some((id, None));
+            }
+        }
         None
     }
 
     fn next_hierarchical(&mut self) -> Option<TrackerItem> {
-        if !self.check_limit() {
-            return None;
-        }
-
         let sub_bitmaps = self.tracker.sub_bitmaps()?;
+        let max_sub_base = self.range.sub_id_max.min(self.tracker.effective_max_sub_id());
 
         while self.current_id < self.range.id_max {
             if let Some(sub_bitmap) = sub_bitmaps.get(&self.current_id) {
-                // Use actual bitmap capacity, clamped by range
-                let bitmap_cap = sub_bitmap.capacity() as u64;
-                let max_sub_id = self
-                    .range
-                    .sub_id_max
-                    .min(self.tracker.effective_max_sub_id())
-                    .min(bitmap_cap);
+                let max_sub_id = max_sub_base.min(sub_bitmap.capacity() as u64);
 
                 while self.current_sub_id < max_sub_id {
                     let sub_id = self.current_sub_id;
                     self.current_sub_id += 1;
-
-                    if sub_id < self.range.sub_id_min {
-                        continue;
+                    if sub_id < self.range.sub_id_min { continue; }
+                    if self.ctx.should_yield(sub_bitmap.test(sub_id as usize)) {
+                        return Some((self.current_id, Some(sub_id)));
                     }
-
-                    let is_set = sub_bitmap.test(sub_id as usize);
-
-                    if !self.matches_filter(is_set) {
-                        continue;
-                    }
-
-                    if !self.passes_sampling() {
-                        continue;
-                    }
-
-                    if !self.check_limit() {
-                        return None;
-                    }
-
-                    self.yielded += 1;
-                    return Some((self.current_id, Some(sub_id)));
                 }
             }
-
             self.current_id += 1;
             self.current_sub_id = self.range.sub_id_min;
         }
-
         None
     }
 }

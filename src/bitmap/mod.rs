@@ -8,10 +8,14 @@
 //! - **Other**: Portable scalar fallback with loop unrolling
 //!
 //! All bit operations are atomic and safe for concurrent access.
+//!
+//! # Fixed-Size Design
+//!
+//! This bitmap has a fixed capacity set at construction time. It does not
+//! grow dynamically. This simplifies the implementation and eliminates
+//! the need for unsafe code or memory management complexity.
 
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-
-use parking_lot::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // Platform-specific implementations
 #[cfg(target_arch = "aarch64")]
@@ -118,17 +122,24 @@ const WORD_MASK: usize = 63;
 // AtomicBitmap
 // ============================================================================
 
-/// A thread-safe, lock-free atomic bitmap.
+/// A thread-safe, lock-free atomic bitmap with fixed capacity.
 ///
 /// `AtomicBitmap` provides efficient storage and manipulation of a set of bits,
 /// where each bit represents whether an ID exists or not. All operations are
 /// atomic and safe for concurrent access from multiple threads.
 ///
+/// # Fixed-Size Design
+///
+/// The bitmap capacity is fixed at construction time and cannot grow. This
+/// design choice:
+/// - Eliminates unsafe code and memory management complexity
+/// - Provides predictable memory usage
+/// - Enables zero-overhead concurrent access
+///
 /// # Features
 ///
 /// - **Lock-free operations**: `test`, `set`, `clear`, `test_and_set` use atomic
 ///   compare-and-swap (CAS) and are wait-free for most operations
-/// - **Auto-growing**: Automatically expands when accessing indices beyond capacity
 /// - **SIMD-accelerated**: Uses ARM NEON or x86 AVX2/POPCNT for bulk operations
 /// - **Memory efficient**: 1 bit per ID, 8 bytes per 64 IDs
 ///
@@ -144,9 +155,12 @@ const WORD_MASK: usize = 63;
 ///
 /// # Thread Safety
 ///
-/// All bit operations are lock-free using atomic primitives. The only blocking
-/// operation is `ensure_capacity` when the bitmap needs to grow, which uses a
-/// mutex to coordinate allocation.
+/// All bit operations are lock-free using atomic primitives.
+///
+/// # Panics
+///
+/// Operations panic if the index exceeds capacity. Use `capacity()` to check
+/// bounds, or use `try_*` methods for fallible operations.
 ///
 /// # Examples
 ///
@@ -218,21 +232,19 @@ const WORD_MASK: usize = 63;
 /// assert_eq!(first_unset, Some(0));
 /// ```
 pub struct AtomicBitmap {
-    /// Bitmap storage. Uses UnsafeCell for interior mutability during growth.
-    words: std::cell::UnsafeCell<Box<[AtomicU64]>>,
+    /// Bitmap storage - fixed size, never reallocated.
+    words: Box<[AtomicU64]>,
 
-    /// Current capacity in bits (always multiple of 64).
-    capacity: AtomicUsize,
+    /// Fixed capacity in bits (always multiple of 64).
+    capacity: usize,
 
     /// Population count (number of set bits).
     /// Updated atomically on set/clear operations.
     popcount: AtomicU64,
-
-    /// Mutex for growth synchronization only.
-    growth_lock: Mutex<()>,
 }
 
-// SAFETY: All bit operations are atomic. Growth is synchronized via mutex.
+// SAFETY: All bit operations use atomic primitives.
+// No unsafe code - the bitmap is fixed-size and never reallocated.
 unsafe impl Send for AtomicBitmap {}
 unsafe impl Sync for AtomicBitmap {}
 
@@ -245,13 +257,13 @@ impl AtomicBitmap {
     /// use keyspace_tracker::AtomicBitmap;
     ///
     /// let bitmap = AtomicBitmap::new();
-    /// assert!(bitmap.capacity() >= 4096);
+    /// assert_eq!(bitmap.capacity(), 4096);
     /// ```
     pub fn new() -> Self {
         Self::with_capacity(INITIAL_CAPACITY_BITS)
     }
 
-    /// Create a new bitmap with specified initial capacity (in bits).
+    /// Create a new bitmap with specified capacity (in bits).
     ///
     /// Capacity is rounded up to the next multiple of 64.
     ///
@@ -267,21 +279,25 @@ impl AtomicBitmap {
         let capacity = capacity_bits.max(64).next_multiple_of(64);
         let word_count = capacity / BITS_PER_WORD;
 
-        let mut words = Vec::with_capacity(word_count);
-        words.resize_with(word_count, || AtomicU64::new(0));
+        let words: Vec<AtomicU64> = (0..word_count).map(|_| AtomicU64::new(0)).collect();
 
         Self {
-            words: std::cell::UnsafeCell::new(words.into_boxed_slice()),
-            capacity: AtomicUsize::new(capacity),
+            words: words.into_boxed_slice(),
+            capacity,
             popcount: AtomicU64::new(0),
-            growth_lock: Mutex::new(()),
         }
     }
 
-    /// Get current capacity in bits.
+    /// Get a reference to the words slice.
+    #[inline]
+    fn words(&self) -> &[AtomicU64] {
+        &self.words
+    }
+
+    /// Get the fixed capacity in bits.
     #[inline]
     pub fn capacity(&self) -> usize {
-        self.capacity.load(Ordering::Acquire)
+        self.capacity
     }
 
     /// Get number of words in the bitmap.
@@ -302,101 +318,45 @@ impl AtomicBitmap {
         self.count() == 0
     }
 
-    /// Ensure capacity for the given bit index.
-    ///
-    /// Returns true if growth occurred.
-    pub fn ensure_capacity(&self, bit_index: usize) -> bool {
-        let required = (bit_index + 1).next_multiple_of(64);
-        if self.capacity() >= required {
-            return false;
-        }
-
-        self.grow(required);
-        true
-    }
-
-    /// Grow the bitmap to at least the specified capacity.
-    fn grow(&self, required_capacity: usize) {
-        let _guard = self.growth_lock.lock();
-
-        // Double-check after acquiring lock
-        let current = self.capacity.load(Ordering::Acquire);
-        if current >= required_capacity {
-            return;
-        }
-
-        // Calculate new capacity (at least double, or required)
-        let new_capacity = std::cmp::max(current * 2, required_capacity).next_multiple_of(64);
-        let new_word_count = new_capacity / BITS_PER_WORD;
-
-        // Allocate new storage
-        let mut new_words: Vec<AtomicU64> = Vec::with_capacity(new_word_count);
-        new_words.resize_with(new_word_count, || AtomicU64::new(0));
-
-        // Copy old data
-        // SAFETY: We hold the growth lock, preventing concurrent growth.
-        let old_words = unsafe { &*self.words.get() };
-        for (i, word) in old_words.iter().enumerate() {
-            new_words[i].store(word.load(Ordering::Relaxed), Ordering::Relaxed);
-        }
-
-        // Swap storage
-        // SAFETY: We hold the growth lock. Readers may see old or new data,
-        // but both are valid (old data is subset of new data).
-        unsafe {
-            *self.words.get() = new_words.into_boxed_slice();
-        }
-
-        // Publish new capacity
-        self.capacity.store(new_capacity, Ordering::Release);
-    }
-
-    /// Get a reference to the words slice.
-    ///
-    /// SAFETY: Caller must ensure no concurrent growth during use.
+    /// Check if index is within bounds.
     #[inline]
-    fn words(&self) -> &[AtomicU64] {
-        // SAFETY: We only read through atomic operations.
-        unsafe { &*self.words.get() }
+    fn check_bounds(&self, index: usize) {
+        assert!(
+            index < self.capacity,
+            "bitmap index {} out of bounds (capacity: {})",
+            index,
+            self.capacity
+        );
     }
 
     /// Load a word value.
     #[inline]
     pub fn load_word(&self, word_index: usize) -> u64 {
-        let words = self.words();
-        if word_index >= words.len() {
-            return 0;
-        }
-        words[word_index].load(Ordering::Acquire)
+        self.words[word_index].load(Ordering::Acquire)
     }
 
     /// Fetch-or on a word, returning the previous value.
     #[inline]
     pub fn word_fetch_or(&self, word_index: usize, mask: u64) -> u64 {
-        let words = self.words();
-        if word_index >= words.len() {
-            return 0;
-        }
-        words[word_index].fetch_or(mask, Ordering::AcqRel)
+        self.words[word_index].fetch_or(mask, Ordering::AcqRel)
     }
 
     /// Fetch-and on a word, returning the previous value.
     #[inline]
     pub fn word_fetch_and(&self, word_index: usize, mask: u64) -> u64 {
-        let words = self.words();
-        if word_index >= words.len() {
-            return u64::MAX;
-        }
-        words[word_index].fetch_and(mask, Ordering::AcqRel)
+        self.words[word_index].fetch_and(mask, Ordering::AcqRel)
     }
 
     /// Set a bit at the given index.
     ///
     /// Returns the previous value (false if was unset, true if was set).
-    /// Auto-grows if index >= capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= capacity`.
     #[inline]
     pub fn set(&self, index: usize) -> bool {
-        self.ensure_capacity(index);
+        self.check_bounds(index);
 
         let word_idx = index >> WORD_SHIFT;
         let bit_idx = index & WORD_MASK;
@@ -415,12 +375,13 @@ impl AtomicBitmap {
     /// Clear a bit at the given index.
     ///
     /// Returns the previous value (true if was set, false if was unset).
-    /// No-op if index >= capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= capacity`.
     #[inline]
     pub fn clear(&self, index: usize) -> bool {
-        if index >= self.capacity() {
-            return false;
-        }
+        self.check_bounds(index);
 
         let word_idx = index >> WORD_SHIFT;
         let bit_idx = index & WORD_MASK;
@@ -438,10 +399,10 @@ impl AtomicBitmap {
 
     /// Test if a bit is set at the given index.
     ///
-    /// Returns false if index >= capacity.
+    /// Returns false if index >= capacity (no panic).
     #[inline]
     pub fn test(&self, index: usize) -> bool {
-        if index >= self.capacity() {
+        if index >= self.capacity {
             return false;
         }
 
@@ -456,21 +417,19 @@ impl AtomicBitmap {
     ///
     /// If the bit is unset (0), sets it to 1 and returns true.
     /// If the bit is already set (1), returns false.
-    /// Auto-grows if index >= capacity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= capacity`.
     #[inline]
     pub fn test_and_set(&self, index: usize) -> bool {
-        self.ensure_capacity(index);
+        self.check_bounds(index);
 
         let word_idx = index >> WORD_SHIFT;
         let bit_idx = index & WORD_MASK;
         let mask = 1u64 << bit_idx;
 
-        let words = self.words();
-        if word_idx >= words.len() {
-            return false;
-        }
-
-        let word = &words[word_idx];
+        let word = &self.words[word_idx];
 
         loop {
             let old = word.load(Ordering::Acquire);
@@ -492,22 +451,19 @@ impl AtomicBitmap {
     ///
     /// If the bit is set (1), clears it to 0 and returns true.
     /// If the bit is already unset (0), returns false.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `index >= capacity`.
     #[inline]
     pub fn test_and_clear(&self, index: usize) -> bool {
-        if index >= self.capacity() {
-            return false;
-        }
+        self.check_bounds(index);
 
         let word_idx = index >> WORD_SHIFT;
         let bit_idx = index & WORD_MASK;
         let mask = 1u64 << bit_idx;
 
-        let words = self.words();
-        if word_idx >= words.len() {
-            return false;
-        }
-
-        let word = &words[word_idx];
+        let word = &self.words[word_idx];
 
         loop {
             let old = word.load(Ordering::Acquire);
@@ -528,26 +484,19 @@ impl AtomicBitmap {
 
     /// Clear all bits and reset to initial capacity.
     ///
-    /// This requires exclusive access (&mut self) as it deallocates storage.
+    /// This requires exclusive access (&mut self).
     pub fn clear_all(&mut self) {
-        let word_count = INITIAL_CAPACITY_BITS / BITS_PER_WORD;
-        let mut words = Vec::with_capacity(word_count);
-        words.resize_with(word_count, || AtomicU64::new(0));
-
-        *self.words.get_mut() = words.into_boxed_slice();
-        *self.capacity.get_mut() = INITIAL_CAPACITY_BITS;
+        for word in self.words.iter() {
+            word.store(0, Ordering::Relaxed);
+        }
         *self.popcount.get_mut() = 0;
     }
 
     /// Clear all bits but retain allocated capacity.
     ///
-    /// This requires exclusive access (&mut self).
+    /// Alias for `clear_all` since capacity is now fixed.
     pub fn reset(&mut self) {
-        let words = self.words.get_mut();
-        for word in words.iter_mut() {
-            *word.get_mut() = 0;
-        }
-        *self.popcount.get_mut() = 0;
+        self.clear_all();
     }
 
     /// Find the first set bit starting from `start_index`.
@@ -555,8 +504,7 @@ impl AtomicBitmap {
     /// Returns None if no set bit is found before capacity.
     /// Uses SIMD-optimized scanning on ARM NEON and x86_64.
     pub fn find_next_set(&self, start_index: usize) -> Option<usize> {
-        let capacity = self.capacity();
-        if start_index >= capacity {
+        if start_index >= self.capacity {
             return None;
         }
 
@@ -569,7 +517,7 @@ impl AtomicBitmap {
         if first_word != 0 {
             let bit = first_word.trailing_zeros() as usize;
             let index = (start_word_idx << WORD_SHIFT) + bit;
-            if index < capacity {
+            if index < self.capacity {
                 return Some(index);
             }
         }
@@ -578,7 +526,7 @@ impl AtomicBitmap {
         if let Some((word_idx, word)) = simd_find_first_nonzero(words, start_word_idx + 1) {
             let bit = word.trailing_zeros() as usize;
             let index = (word_idx << WORD_SHIFT) + bit;
-            if index < capacity {
+            if index < self.capacity {
                 return Some(index);
             }
         }
@@ -591,9 +539,11 @@ impl AtomicBitmap {
     /// Returns None if no unset bit is found before `max_index`.
     /// Uses SIMD-optimized scanning on ARM NEON and x86_64.
     pub fn find_next_unset(&self, start_index: usize, max_index: usize) -> Option<usize> {
-        let capacity = self.capacity();
-        let limit = max_index.min(capacity);
+        if start_index >= max_index {
+            return None;
+        }
 
+        let limit = max_index.min(self.capacity);
         if start_index >= limit {
             return None;
         }
@@ -672,9 +622,12 @@ impl AtomicBitmap {
     /// Set all bits in range [start, end).
     ///
     /// This is more efficient than calling `set()` in a loop for bulk initialization.
-    /// Auto-grows if end > capacity.
     ///
     /// Returns the number of bits that were newly set (were previously unset).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `end > capacity`.
     ///
     /// # Examples
     ///
@@ -691,10 +644,12 @@ impl AtomicBitmap {
             return 0;
         }
 
-        // Ensure capacity for the entire range
-        if end > 0 {
-            self.ensure_capacity(end - 1);
-        }
+        assert!(
+            end <= self.capacity,
+            "set_range end {} exceeds capacity {}",
+            end,
+            self.capacity
+        );
 
         let start_word = start >> WORD_SHIFT;
         let end_word = (end + BITS_PER_WORD - 1) >> WORD_SHIFT;
@@ -714,10 +669,8 @@ impl AtomicBitmap {
                 mask
             };
 
-            if start_word < words.len() {
-                let old = words[start_word].fetch_or(mask, Ordering::AcqRel);
-                newly_set += (mask & !old).count_ones() as u64;
-            }
+            let old = words[start_word].fetch_or(mask, Ordering::AcqRel);
+            newly_set += (mask & !old).count_ones() as u64;
 
             // If fully handled in first word, we're done
             if start_word == end_word - 1 {
@@ -730,14 +683,14 @@ impl AtomicBitmap {
         let first_full_word = if start_bit != 0 { start_word + 1 } else { start_word };
         let last_full_word = if (end & WORD_MASK) != 0 { end_word - 1 } else { end_word };
 
-        for word_idx in first_full_word..last_full_word.min(words.len()) {
+        for word_idx in first_full_word..last_full_word {
             let old = words[word_idx].fetch_or(u64::MAX, Ordering::AcqRel);
             newly_set += (!old).count_ones() as u64;
         }
 
         // Handle last partial word
         let end_bit = end & WORD_MASK;
-        if end_bit != 0 && last_full_word < end_word && last_full_word < words.len() {
+        if end_bit != 0 && last_full_word < end_word {
             let mask = (1u64 << end_bit) - 1;
             let old = words[last_full_word].fetch_or(mask, Ordering::AcqRel);
             newly_set += (mask & !old).count_ones() as u64;
@@ -750,9 +703,12 @@ impl AtomicBitmap {
     /// Clear all bits in range [start, end).
     ///
     /// This is more efficient than calling `clear()` in a loop.
-    /// No-op for bits beyond capacity.
     ///
     /// Returns the number of bits that were cleared (were previously set).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `end > capacity`.
     ///
     /// # Examples
     ///
@@ -770,11 +726,12 @@ impl AtomicBitmap {
             return 0;
         }
 
-        let capacity = self.capacity();
-        let end = end.min(capacity);
-        if start >= end {
-            return 0;
-        }
+        assert!(
+            end <= self.capacity,
+            "clear_range end {} exceeds capacity {}",
+            end,
+            self.capacity
+        );
 
         let start_word = start >> WORD_SHIFT;
         let end_word = (end + BITS_PER_WORD - 1) >> WORD_SHIFT;
@@ -793,10 +750,8 @@ impl AtomicBitmap {
                 mask
             };
 
-            if start_word < words.len() {
-                let old = words[start_word].fetch_and(!mask, Ordering::AcqRel);
-                cleared += (mask & old).count_ones() as u64;
-            }
+            let old = words[start_word].fetch_and(!mask, Ordering::AcqRel);
+            cleared += (mask & old).count_ones() as u64;
 
             if start_word == end_word - 1 {
                 self.popcount.fetch_sub(cleared, Ordering::Relaxed);
@@ -808,14 +763,14 @@ impl AtomicBitmap {
         let first_full_word = if start_bit != 0 { start_word + 1 } else { start_word };
         let last_full_word = if (end & WORD_MASK) != 0 { end_word - 1 } else { end_word };
 
-        for word_idx in first_full_word..last_full_word.min(words.len()) {
+        for word_idx in first_full_word..last_full_word {
             let old = words[word_idx].swap(0, Ordering::AcqRel);
             cleared += old.count_ones() as u64;
         }
 
         // Handle last partial word
         let end_bit = end & WORD_MASK;
-        if end_bit != 0 && last_full_word < end_word && last_full_word < words.len() {
+        if end_bit != 0 && last_full_word < end_word {
             let mask = (1u64 << end_bit) - 1;
             let old = words[last_full_word].fetch_and(!mask, Ordering::AcqRel);
             cleared += (mask & old).count_ones() as u64;
@@ -828,16 +783,21 @@ impl AtomicBitmap {
     /// Count set bits in range [start, end) without modifying.
     ///
     /// More efficient than iterating for large ranges.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `end > capacity`.
     pub fn count_range(&self, start: usize, end: usize) -> u64 {
         if start >= end {
             return 0;
         }
 
-        let capacity = self.capacity();
-        let end = end.min(capacity);
-        if start >= end {
-            return 0;
-        }
+        assert!(
+            end <= self.capacity,
+            "count_range end {} exceeds capacity {}",
+            end,
+            self.capacity
+        );
 
         let start_word = start >> WORD_SHIFT;
         let end_word = (end + BITS_PER_WORD - 1) >> WORD_SHIFT;
@@ -856,9 +816,7 @@ impl AtomicBitmap {
                 mask
             };
 
-            if start_word < words.len() {
-                count += (words[start_word].load(Ordering::Relaxed) & mask).count_ones() as u64;
-            }
+            count += (words[start_word].load(Ordering::Relaxed) & mask).count_ones() as u64;
 
             if start_word == end_word - 1 {
                 return count;
@@ -870,13 +828,13 @@ impl AtomicBitmap {
         let last_full_word = if (end & WORD_MASK) != 0 { end_word - 1 } else { end_word };
 
         if last_full_word > first_full_word {
-            let full_range = &words[first_full_word..last_full_word.min(words.len())];
+            let full_range = &words[first_full_word..last_full_word];
             count += simd_popcount_slice(full_range);
         }
 
         // Handle last partial word
         let end_bit = end & WORD_MASK;
-        if end_bit != 0 && last_full_word < end_word && last_full_word < words.len() {
+        if end_bit != 0 && last_full_word < end_word {
             let mask = (1u64 << end_bit) - 1;
             count += (words[last_full_word].load(Ordering::Relaxed) & mask).count_ones() as u64;
         }
@@ -916,10 +874,8 @@ impl AtomicBitmap {
         let data: Vec<u64> = words.iter()
             .map(|w| w.load(Ordering::Relaxed))
             .collect();
-        let capacity = self.capacity();
-        let count = self.count();
 
-        crate::config::BitmapSnapshot::from_raw(data, capacity, count)
+        crate::config::BitmapSnapshot::from_raw(data, self.capacity, self.count())
     }
 }
 
@@ -932,7 +888,7 @@ impl Default for AtomicBitmap {
 impl std::fmt::Debug for AtomicBitmap {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AtomicBitmap")
-            .field("capacity", &self.capacity())
+            .field("capacity", &self.capacity)
             .field("count", &self.count())
             .finish()
     }
@@ -980,7 +936,7 @@ mod tests {
 
     #[test]
     fn test_set_and_test() {
-        let bm = AtomicBitmap::new();
+        let bm = AtomicBitmap::with_capacity(1000);
 
         assert!(!bm.test(0));
         assert!(!bm.set(0)); // Returns false (was not set)
@@ -998,7 +954,7 @@ mod tests {
 
     #[test]
     fn test_clear() {
-        let bm = AtomicBitmap::new();
+        let bm = AtomicBitmap::with_capacity(1000);
 
         bm.set(42);
         assert!(bm.test(42));
@@ -1013,7 +969,7 @@ mod tests {
 
     #[test]
     fn test_test_and_set() {
-        let bm = AtomicBitmap::new();
+        let bm = AtomicBitmap::with_capacity(1000);
 
         assert!(bm.test_and_set(100)); // Success, was unset
         assert!(!bm.test_and_set(100)); // Failure, already set
@@ -1023,7 +979,7 @@ mod tests {
 
     #[test]
     fn test_test_and_clear() {
-        let bm = AtomicBitmap::new();
+        let bm = AtomicBitmap::with_capacity(1000);
 
         bm.set(100);
         assert!(bm.test_and_clear(100)); // Success, was set
@@ -1033,18 +989,22 @@ mod tests {
     }
 
     #[test]
-    fn test_auto_growth() {
+    #[should_panic(expected = "out of bounds")]
+    fn test_set_out_of_bounds_panics() {
         let bm = AtomicBitmap::with_capacity(64);
-        assert_eq!(bm.capacity(), 64);
+        bm.set(1000); // Should panic
+    }
 
-        bm.set(1000);
-        assert!(bm.capacity() >= 1001);
-        assert!(bm.test(1000));
+    #[test]
+    fn test_test_out_of_bounds_returns_false() {
+        let bm = AtomicBitmap::with_capacity(64);
+        // test() returns false for out-of-bounds, doesn't panic
+        assert!(!bm.test(1000));
     }
 
     #[test]
     fn test_popcount() {
-        let bm = AtomicBitmap::new();
+        let bm = AtomicBitmap::with_capacity(1000);
 
         bm.set(0);
         bm.set(1);
@@ -1060,7 +1020,7 @@ mod tests {
 
     #[test]
     fn test_find_next_set() {
-        let bm = AtomicBitmap::new();
+        let bm = AtomicBitmap::with_capacity(2000);
 
         bm.set(10);
         bm.set(100);
@@ -1139,7 +1099,7 @@ mod tests {
 
     #[test]
     fn test_clear_all() {
-        let mut bm = AtomicBitmap::new();
+        let mut bm = AtomicBitmap::with_capacity(1000);
 
         for i in 0..100 {
             bm.set(i);
@@ -1148,7 +1108,8 @@ mod tests {
 
         bm.clear_all();
         assert_eq!(bm.count(), 0);
-        assert_eq!(bm.capacity(), INITIAL_CAPACITY_BITS);
+        // Capacity is preserved (fixed-size)
+        assert_eq!(bm.capacity(), 1024); // Rounded up to multiple of 64
     }
 
     #[test]
@@ -1167,7 +1128,7 @@ mod tests {
 
     #[test]
     fn test_recompute_count() {
-        let bm = AtomicBitmap::new();
+        let bm = AtomicBitmap::with_capacity(1000);
 
         for i in 0..100 {
             bm.set(i);

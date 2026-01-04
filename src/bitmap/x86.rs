@@ -442,12 +442,199 @@ mod avx2 {
 }
 
 // ============================================================================
-// AVX-512 Implementation (Skylake-X+)
+// AVX-512 Implementation (Skylake-X+ with VPOPCNTDQ for Ice Lake+)
 // ============================================================================
 
-// AVX-512 VPOPCNTDQ would go here for Ice Lake+
-// Uses _mm512_popcnt_epi64 for native vector popcount
-// For now, AVX2 + POPCNT is sufficient for most servers
+mod avx512 {
+    use super::*;
+    use std::arch::x86_64::*;
+
+    /// Count set bits using AVX-512 VPOPCNTDQ (native 512-bit vector popcount).
+    /// This is the fastest bulk popcount on Ice Lake, Zen 4+, Sapphire Rapids.
+    #[inline]
+    #[target_feature(enable = "avx512f,avx512vpopcntdq")]
+    pub unsafe fn popcount_slice_avx512(words: &[AtomicU64]) -> u64 {
+        let mut total: u64 = 0;
+        let mut i = 0;
+        let len = words.len();
+
+        // Process 8 words (512 bits) per iteration
+        while i + 8 <= len {
+            // Prefetch 2 cache lines ahead for streaming access
+            if i + 16 < len {
+                prefetch_read(words[i + 16..].as_ptr());
+            }
+
+            // Load 8 u64s into 512-bit register
+            let w0 = words[i].load(Ordering::Relaxed);
+            let w1 = words[i + 1].load(Ordering::Relaxed);
+            let w2 = words[i + 2].load(Ordering::Relaxed);
+            let w3 = words[i + 3].load(Ordering::Relaxed);
+            let w4 = words[i + 4].load(Ordering::Relaxed);
+            let w5 = words[i + 5].load(Ordering::Relaxed);
+            let w6 = words[i + 6].load(Ordering::Relaxed);
+            let w7 = words[i + 7].load(Ordering::Relaxed);
+
+            let v = _mm512_set_epi64(
+                w7 as i64, w6 as i64, w5 as i64, w4 as i64,
+                w3 as i64, w2 as i64, w1 as i64, w0 as i64,
+            );
+
+            // Native vector popcount - single instruction for 8 u64s!
+            let cnt = _mm512_popcnt_epi64(v);
+
+            // Reduce: sum all 8 counts
+            total += _mm512_reduce_add_epi64(cnt) as u64;
+
+            i += 8;
+        }
+
+        // AVX2 tail for 4-word chunks
+        while i + 4 <= len {
+            let w0 = words[i].load(Ordering::Relaxed);
+            let w1 = words[i + 1].load(Ordering::Relaxed);
+            let w2 = words[i + 2].load(Ordering::Relaxed);
+            let w3 = words[i + 3].load(Ordering::Relaxed);
+
+            total += w0.count_ones() as u64 + w1.count_ones() as u64;
+            total += w2.count_ones() as u64 + w3.count_ones() as u64;
+
+            i += 4;
+        }
+
+        // Scalar tail
+        while i < len {
+            total += words[i].load(Ordering::Relaxed).count_ones() as u64;
+            i += 1;
+        }
+
+        total
+    }
+
+    /// Find first non-zero using AVX-512 masked comparison.
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn find_first_nonzero_avx512(
+        words: &[AtomicU64],
+        start_word: usize,
+    ) -> Option<(usize, u64)> {
+        let len = words.len();
+        if start_word >= len {
+            return None;
+        }
+
+        let mut i = start_word;
+        let zero = _mm512_setzero_si512();
+
+        // Process 8 words at a time
+        while i + 8 <= len {
+            if i + 16 < len {
+                prefetch_read(words[i + 16..].as_ptr());
+            }
+
+            let w0 = words[i].load(Ordering::Relaxed);
+            let w1 = words[i + 1].load(Ordering::Relaxed);
+            let w2 = words[i + 2].load(Ordering::Relaxed);
+            let w3 = words[i + 3].load(Ordering::Relaxed);
+            let w4 = words[i + 4].load(Ordering::Relaxed);
+            let w5 = words[i + 5].load(Ordering::Relaxed);
+            let w6 = words[i + 6].load(Ordering::Relaxed);
+            let w7 = words[i + 7].load(Ordering::Relaxed);
+
+            let v = _mm512_set_epi64(
+                w7 as i64, w6 as i64, w5 as i64, w4 as i64,
+                w3 as i64, w2 as i64, w1 as i64, w0 as i64,
+            );
+
+            // Compare with zero, get 8-bit mask
+            let mask = _mm512_cmpneq_epi64_mask(v, zero);
+
+            if mask != 0 {
+                // Find first non-zero in batch
+                let idx = mask.trailing_zeros() as usize;
+                let word = match idx {
+                    0 => w0, 1 => w1, 2 => w2, 3 => w3,
+                    4 => w4, 5 => w5, 6 => w6, _ => w7,
+                };
+                return Some((i + idx, word));
+            }
+
+            i += 8;
+        }
+
+        // Scalar tail
+        while i < len {
+            let w = words[i].load(Ordering::Relaxed);
+            if w != 0 {
+                return Some((i, w));
+            }
+            i += 1;
+        }
+
+        None
+    }
+
+    /// Find first word with unset bits using AVX-512.
+    #[inline]
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn find_first_not_full_avx512(
+        words: &[AtomicU64],
+        start_word: usize,
+    ) -> Option<(usize, u64)> {
+        let len = words.len();
+        if start_word >= len {
+            return None;
+        }
+
+        let mut i = start_word;
+        let all_ones = _mm512_set1_epi64(-1i64);
+
+        while i + 8 <= len {
+            if i + 16 < len {
+                prefetch_read(words[i + 16..].as_ptr());
+            }
+
+            let w0 = words[i].load(Ordering::Relaxed);
+            let w1 = words[i + 1].load(Ordering::Relaxed);
+            let w2 = words[i + 2].load(Ordering::Relaxed);
+            let w3 = words[i + 3].load(Ordering::Relaxed);
+            let w4 = words[i + 4].load(Ordering::Relaxed);
+            let w5 = words[i + 5].load(Ordering::Relaxed);
+            let w6 = words[i + 6].load(Ordering::Relaxed);
+            let w7 = words[i + 7].load(Ordering::Relaxed);
+
+            let v = _mm512_set_epi64(
+                w7 as i64, w6 as i64, w5 as i64, w4 as i64,
+                w3 as i64, w2 as i64, w1 as i64, w0 as i64,
+            );
+
+            let mask = _mm512_cmpneq_epi64_mask(v, all_ones);
+
+            if mask != 0 {
+                let idx = mask.trailing_zeros() as usize;
+                let word = match idx {
+                    0 => w0, 1 => w1, 2 => w2, 3 => w3,
+                    4 => w4, 5 => w5, 6 => w6, _ => w7,
+                };
+                return Some((i + idx, word));
+            }
+
+            i += 8;
+        }
+
+        // Scalar tail
+        const ALL_ONES: u64 = !0u64;
+        while i < len {
+            let w = words[i].load(Ordering::Relaxed);
+            if w != ALL_ONES {
+                return Some((i, w));
+            }
+            i += 1;
+        }
+
+        None
+    }
+}
 
 // ============================================================================
 // Public API - Runtime Dispatch
@@ -458,7 +645,9 @@ mod avx2 {
 pub fn popcount_slice(words: &[AtomicU64]) -> u64 {
     let caps = X86Capabilities::get();
 
-    if caps.avx2 {
+    if caps.avx512vpopcntdq {
+        unsafe { avx512::popcount_slice_avx512(words) }
+    } else if caps.avx2 {
         unsafe { avx2::popcount_slice_avx2(words) }
     } else if caps.popcnt {
         unsafe { popcnt::popcount_slice_popcnt(words) }
@@ -472,7 +661,9 @@ pub fn popcount_slice(words: &[AtomicU64]) -> u64 {
 pub fn find_first_nonzero(words: &[AtomicU64], start_word: usize) -> Option<(usize, u64)> {
     let caps = X86Capabilities::get();
 
-    if caps.avx2 {
+    if caps.avx512f {
+        unsafe { avx512::find_first_nonzero_avx512(words, start_word) }
+    } else if caps.avx2 {
         unsafe { avx2::find_first_nonzero_avx2(words, start_word) }
     } else if caps.popcnt {
         unsafe { popcnt::find_first_nonzero_popcnt(words, start_word) }
@@ -486,7 +677,9 @@ pub fn find_first_nonzero(words: &[AtomicU64], start_word: usize) -> Option<(usi
 pub fn find_first_not_full(words: &[AtomicU64], start_word: usize) -> Option<(usize, u64)> {
     let caps = X86Capabilities::get();
 
-    if caps.avx2 {
+    if caps.avx512f {
+        unsafe { avx512::find_first_not_full_avx512(words, start_word) }
+    } else if caps.avx2 {
         unsafe { avx2::find_first_not_full_avx2(words, start_word) }
     } else if caps.popcnt {
         unsafe { popcnt::find_first_not_full_popcnt(words, start_word) }
@@ -569,6 +762,36 @@ mod tests {
             let words = make_words(&[!0u64; 8]);
             unsafe {
                 assert_eq!(avx2::popcount_slice_avx2(&words), 64 * 8);
+            }
+        }
+    }
+
+    #[test]
+    fn test_avx512_popcount_impl() {
+        if X86Capabilities::get().avx512vpopcntdq {
+            let words = make_words(&[!0u64; 16]);
+            unsafe {
+                assert_eq!(avx512::popcount_slice_avx512(&words), 64 * 16);
+            }
+        }
+    }
+
+    #[test]
+    fn test_avx512_find_nonzero_impl() {
+        if X86Capabilities::get().avx512f {
+            let words = make_words(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 42, 0, 0]);
+            unsafe {
+                assert_eq!(avx512::find_first_nonzero_avx512(&words, 0), Some((9, 42)));
+            }
+        }
+    }
+
+    #[test]
+    fn test_avx512_find_not_full_impl() {
+        if X86Capabilities::get().avx512f {
+            let words = make_words(&[!0u64; 10].into_iter().chain([42]).collect::<Vec<_>>());
+            unsafe {
+                assert_eq!(avx512::find_first_not_full_avx512(&words, 0), Some((10, 42)));
             }
         }
     }
