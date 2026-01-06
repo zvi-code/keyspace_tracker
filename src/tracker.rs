@@ -801,10 +801,10 @@ impl PrefixTracker {
         let mut added = 0u64;
 
         for id in 0..max_id {
-            if pattern.should_exist(id, max_id, &mut rng) {
-                if self.primary_bitmap.test_and_set(id as usize) {
-                    added += 1;
-                }
+            if pattern.should_exist(id, max_id, &mut rng)
+                && self.primary_bitmap.test_and_set(id as usize)
+            {
+                added += 1;
             }
         }
 

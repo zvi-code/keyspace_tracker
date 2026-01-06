@@ -431,6 +431,38 @@ impl Iterator for GroupIter {
             IterOrder::Random => self.next_random(),
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        if self.exhausted {
+            return (0, Some(0));
+        }
+
+        // If limit is set, use it as upper bound
+        if let Some(limit) = self.ctx.sampling.limit {
+            let remaining = limit.saturating_sub(self.ctx.yielded()) as usize;
+            return (0, Some(remaining));
+        }
+
+        // For horizontal order, sum up remaining IDs across all trackers
+        if matches!(self.order, IterOrder::Horizontal) {
+            let mut total: usize = 0;
+            for (i, tracker) in self.trackers.iter().enumerate() {
+                let max_id = self.range.id_max.min(tracker.effective_max_id()) as usize;
+                if i == self.prefix_index {
+                    total += max_id.saturating_sub(self.current_id as usize);
+                } else if i > self.prefix_index {
+                    total += max_id.saturating_sub(self.range.id_min as usize);
+                }
+            }
+            return (0, Some(total));
+        }
+
+        // For vertical/random, estimate based on total capacity
+        let total: usize = self.trackers.iter()
+            .map(|t| self.range.id_max.min(t.effective_max_id()).saturating_sub(self.range.id_min) as usize)
+            .sum();
+        (0, Some(total))
+    }
 }
 
 // ============================================================================
@@ -470,6 +502,7 @@ impl GroupWriteIter {
     }
     
     /// Atomically claim next (prefix, id, sub_id) and mark as set.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<GroupItem> {
         if self.trackers.is_empty() {
             return None;
@@ -665,6 +698,7 @@ pub struct GroupDeleteIter {
 
 impl GroupDeleteIter {
     /// Atomically claim next set ID and clear it.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<GroupItem> {
         if self.trackers.is_empty() {
             return None;
@@ -766,6 +800,26 @@ impl Iterator for GroupPartitionedIter {
             self.current_sub_id = self.range.sub_id_min;
         }
         None
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // If limit is set, use it as upper bound
+        if let Some(limit) = self.ctx.sampling.limit {
+            let remaining = limit.saturating_sub(self.ctx.yielded()) as usize;
+            return (0, Some(remaining));
+        }
+
+        // Sum remaining IDs across all trackers from current position
+        let mut total: usize = 0;
+        for (i, tracker) in self.trackers.iter().enumerate() {
+            let max_id = self.range.id_max.min(tracker.effective_max_id()) as usize;
+            if i == self.prefix_index {
+                total += max_id.saturating_sub(self.current_id as usize);
+            } else if i > self.prefix_index {
+                total += max_id.saturating_sub(self.range.id_min as usize);
+            }
+        }
+        (0, Some(total))
     }
 }
 

@@ -666,6 +666,34 @@ impl Iterator for SequentialIter<'_> {
             self.next_simple()
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // If limit is set, use it as upper bound
+        if let Some(limit) = self.ctx.sampling.limit {
+            let remaining = limit.saturating_sub(self.ctx.yielded()) as usize;
+            return (0, Some(remaining));
+        }
+
+        // For set_only without sampling, we can estimate based on count
+        if self.ctx.can_use_find_next_set() && !self.tracker.is_hierarchical() {
+            let total_set = self.tracker.count() as usize;
+            // Upper bound is total set bits minus what we've yielded
+            let remaining = total_set.saturating_sub(self.ctx.yielded() as usize);
+            return (0, Some(remaining));
+        }
+
+        // For unset_only, estimate based on remaining range
+        if self.ctx.can_use_find_next_unset() && !self.tracker.is_hierarchical() {
+            let remaining_range = self.max_id.saturating_sub(self.current_id) as usize;
+            let set_bits = self.tracker.count() as usize;
+            let estimated_unset = remaining_range.saturating_sub(set_bits);
+            return (0, Some(estimated_unset));
+        }
+
+        // Fallback: remaining range as upper bound
+        let remaining = self.max_id.saturating_sub(self.current_id) as usize;
+        (0, Some(remaining))
+    }
 }
 
 // ============================================================================
@@ -762,6 +790,18 @@ impl Iterator for RandomIter<'_> {
             Some((id, None))
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // If limit is set, use it as upper bound
+        if let Some(limit) = self.ctx.sampling.limit {
+            let remaining = limit.saturating_sub(self.ctx.yielded()) as usize;
+            return (0, Some(remaining));
+        }
+
+        // Remaining steps as upper bound
+        let remaining_steps = self.max_steps.saturating_sub(self.current_step) as usize;
+        (0, Some(remaining_steps))
+    }
 }
 
 // ============================================================================
@@ -808,6 +848,7 @@ impl<'a> WriteIter<'a> {
     /// Atomically claim next ID and mark as set.
     ///
     /// Returns `None` when range is exhausted (unless `wrap_around()` is enabled).
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<TrackerItem> {
         if self.tracker.is_hierarchical() {
             self.next_hierarchical()
@@ -987,6 +1028,7 @@ pub struct DeleteIter<'a> {
 
 impl<'a> DeleteIter<'a> {
     /// Atomically claim next set ID and clear it.
+    #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Option<TrackerItem> {
         if self.tracker.is_hierarchical() {
             self.next_hierarchical()
@@ -1088,6 +1130,18 @@ impl Iterator for PartitionedIter<'_> {
             self.next_simple()
         }
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        // If limit is set, use it as upper bound
+        if let Some(limit) = self.ctx.sampling.limit {
+            let remaining = limit.saturating_sub(self.ctx.yielded()) as usize;
+            return (0, Some(remaining));
+        }
+
+        // Partition range as upper bound
+        let remaining = self.range.id_max.saturating_sub(self.current_id) as usize;
+        (0, Some(remaining))
+    }
 }
 
 impl<'a> PartitionedIter<'a> {
@@ -1153,6 +1207,66 @@ impl<'a> PartitionedIter<'a> {
 mod tests {
     use super::*;
     use crate::TrackerConfig;
+
+    // ========================================================================
+    // Size Hint Tests
+    // ========================================================================
+
+    #[test]
+    fn test_size_hint_sequential_set_only() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(1000));
+        for i in 0..100 {
+            tracker.add(i);
+        }
+
+        let iter = tracker.iter().set_only().sequential();
+        let (_, upper) = iter.size_hint();
+
+        // Upper bound should be the count of set bits
+        assert_eq!(upper, Some(100));
+    }
+
+    #[test]
+    fn test_size_hint_sequential_with_limit() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(1000));
+        for i in 0..100 {
+            tracker.add(i);
+        }
+
+        let iter = tracker.iter().set_only().limit(50).sequential();
+        let (_, upper) = iter.size_hint();
+
+        // Upper bound should be the limit
+        assert_eq!(upper, Some(50));
+    }
+
+    #[test]
+    fn test_size_hint_random() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(1000));
+        for i in 0..100 {
+            tracker.add(i);
+        }
+
+        let iter = tracker.iter().set_only().random();
+        let (_, upper) = iter.size_hint();
+
+        // Upper bound should be max_steps (range_size)
+        assert_eq!(upper, Some(1000));
+    }
+
+    #[test]
+    fn test_size_hint_partitioned() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(1000));
+        for i in 0..100 {
+            tracker.add(i);
+        }
+
+        let iter = tracker.iter().set_only().partition(0, 4);
+        let (_, upper) = iter.size_hint();
+
+        // Upper bound should be partition range (1000 / 4 = 250)
+        assert_eq!(upper, Some(250));
+    }
 
     // ========================================================================
     // Sampling Tests

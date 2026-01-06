@@ -220,7 +220,8 @@ impl Default for SamplingConfig {
 #[derive(Clone)]
 pub struct FilterContext {
     filter: BitFilter,
-    sampling: SamplingConfig,
+    /// Sampling configuration (pub for size_hint access in iterators).
+    pub(crate) sampling: SamplingConfig,
     rng: fastrand::Rng,
     yielded: u64,
 }
@@ -387,9 +388,10 @@ impl Default for FilterContext {
 /// // 10% of keys handle 90% of traffic
 /// let dist = AccessDistribution::Hotspot { hot_pct: 0.1, hot_prob: 0.9 };
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum AccessDistribution {
     /// Equal probability for all keys in range.
+    #[default]
     Uniform,
 
     /// Zipfian distribution: P(k) ∝ 1/k^s where s is skew.
@@ -435,12 +437,6 @@ pub enum AccessDistribution {
         /// Probability of accessing recent vs old (0.0-1.0)
         recent_prob: f64,
     },
-}
-
-impl Default for AccessDistribution {
-    fn default() -> Self {
-        Self::Uniform
-    }
 }
 
 impl AccessDistribution {
@@ -576,9 +572,10 @@ impl AccessDistribution {
 /// // Clusters of 100 keys with gaps
 /// let pattern = FragmentationPattern::Clustered { cluster_size: 100, gap_size: 50 };
 /// ```
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub enum FragmentationPattern {
     /// No fragmentation - all keys present.
+    #[default]
     None,
 
     /// Random holes with specified density (0.0-1.0 = fraction present).
@@ -616,12 +613,6 @@ pub enum FragmentationPattern {
         /// Average gap between holes
         avg_gap_size: u64,
     },
-}
-
-impl Default for FragmentationPattern {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl FragmentationPattern {
@@ -1044,7 +1035,9 @@ impl BitmapSnapshot {
     /// Compute intersection with another snapshot.
     /// Returns IDs that are set in both.
     pub fn intersection(&self, other: &BitmapSnapshot) -> Vec<u64> {
-        let mut result = Vec::new();
+        // Pre-allocate based on intersection count to avoid reallocations
+        let estimated = self.intersection_count(other) as usize;
+        let mut result = Vec::with_capacity(estimated);
         let min_words = self.data.len().min(other.data.len());
 
         for word_idx in 0..min_words {
@@ -1060,7 +1053,9 @@ impl BitmapSnapshot {
 
     /// Compute difference: IDs in self but not in other.
     pub fn difference(&self, other: &BitmapSnapshot) -> Vec<u64> {
-        let mut result = Vec::new();
+        // Pre-allocate based on difference count to avoid reallocations
+        let estimated = self.difference_count(other) as usize;
+        let mut result = Vec::with_capacity(estimated);
 
         for word_idx in 0..self.data.len() {
             let other_word = if word_idx < other.data.len() { other.data[word_idx] } else { 0 };
@@ -1185,6 +1180,7 @@ impl ReferenceSet {
     }
 
     /// Create from iterator of IDs.
+    #[allow(clippy::should_implement_trait)]
     pub fn from_iter(ids: impl IntoIterator<Item = u64>) -> Self {
         let ids: Vec<u64> = ids.into_iter().collect();
         let max_id = ids.iter().copied().max().unwrap_or(0) + 1;
@@ -1691,19 +1687,15 @@ impl IdCursor {
 }
 
 /// Filter for selecting which prefixes to iterate in group iteration.
+#[derive(Default)]
 pub enum PrefixFilter {
     /// Include all registered prefixes.
+    #[default]
     All,
     /// Include only these exact prefixes.
     Exact(Vec<String>),
     /// Include prefixes matching this predicate.
     Predicate(Arc<dyn Fn(&str) -> bool + Send + Sync>),
-}
-
-impl Default for PrefixFilter {
-    fn default() -> Self {
-        Self::All
-    }
 }
 
 impl std::fmt::Debug for PrefixFilter {

@@ -276,7 +276,9 @@ impl AtomicBitmap {
     /// assert!(bitmap.capacity() >= 1_000_000);
     /// ```
     pub fn with_capacity(capacity_bits: usize) -> Self {
-        let capacity = capacity_bits.max(64).next_multiple_of(64);
+        // Round up to next multiple of 64 (MSRV-compatible alternative to next_multiple_of)
+        let min_capacity = capacity_bits.max(64);
+        let capacity = ((min_capacity + 63) / 64) * 64;
         let word_count = capacity / BITS_PER_WORD;
 
         let words: Vec<AtomicU64> = (0..word_count).map(|_| AtomicU64::new(0)).collect();
@@ -683,8 +685,8 @@ impl AtomicBitmap {
         let first_full_word = if start_bit != 0 { start_word + 1 } else { start_word };
         let last_full_word = if (end & WORD_MASK) != 0 { end_word - 1 } else { end_word };
 
-        for word_idx in first_full_word..last_full_word {
-            let old = words[word_idx].fetch_or(u64::MAX, Ordering::AcqRel);
+        for word in words.iter().take(last_full_word).skip(first_full_word) {
+            let old = word.fetch_or(u64::MAX, Ordering::AcqRel);
             newly_set += (!old).count_ones() as u64;
         }
 
@@ -763,8 +765,8 @@ impl AtomicBitmap {
         let first_full_word = if start_bit != 0 { start_word + 1 } else { start_word };
         let last_full_word = if (end & WORD_MASK) != 0 { end_word - 1 } else { end_word };
 
-        for word_idx in first_full_word..last_full_word {
-            let old = words[word_idx].swap(0, Ordering::AcqRel);
+        for word in words.iter().take(last_full_word).skip(first_full_word) {
+            let old = word.swap(0, Ordering::AcqRel);
             cleared += old.count_ones() as u64;
         }
 
