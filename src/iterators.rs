@@ -1,12 +1,70 @@
 //! Single-tracker iterators.
 //!
 //! Provides various iterator types for iterating over a `PrefixTracker`:
-//! - `SequentialIter`: Ascending order iteration
-//! - `RandomIter`: Pseudo-random order iteration
-//! - `WriteIter`: Concurrent write with atomic claim-and-set
-//! - `DeleteIter`: Exclusive delete iteration
-//! - `PartitionedIter`: Parallel iteration with disjoint ranges
-//! - `SamplingIter`: Wrapper for mixed-ratio and probabilistic sampling
+//! - [`SequentialIter`]: Ascending order iteration with optional wrap-around
+//! - [`RandomIter`]: Pseudo-random order iteration with cycling support
+//! - [`WriteIter`]: Concurrent write with atomic claim-and-set
+//! - [`DeleteIter`]: Exclusive delete iteration
+//! - [`PartitionedIter`]: Parallel iteration with disjoint ranges
+//!
+//! ## Wrap-Around and Time-Based Iteration
+//!
+//! Iterators support two modes for running workloads longer than the keyspace:
+//!
+//! ### Wrap-Around Mode
+//!
+//! Enable with `.wrap_around()` on [`SequentialIter`] or [`WriteIter`]:
+//!
+//! ```rust
+//! use keyspace_tracker::PrefixTracker;
+//!
+//! let tracker = PrefixTracker::simple("vec:");
+//! for i in 0..100 { tracker.add(i); }
+//!
+//! // Iterate 500 times over 100 keys (5 full cycles)
+//! let mut iter = tracker.iter().set_only().sequential().wrap_around();
+//! for _ in 0..500 {
+//!     let (id, _) = iter.next().unwrap();
+//!     // ids cycle: 0,1,2,...,99,0,1,2,...
+//! }
+//! ```
+//!
+//! ### Cycling with Limit > Keyspace
+//!
+//! [`RandomIter`] automatically cycles when `limit` exceeds keyspace size:
+//!
+//! ```rust
+//! use keyspace_tracker::{PrefixTracker, SamplingConfig};
+//!
+//! let tracker = PrefixTracker::simple("vec:");
+//! for i in 0..100 { tracker.add(i); }
+//!
+//! // Request 1000 items from 100-key space - cycles automatically
+//! let items: Vec<_> = tracker.iter()
+//!     .set_only()
+//!     .with_sampling(SamplingConfig::default().with_limit(1000))
+//!     .random()
+//!     .collect();
+//! assert_eq!(items.len(), 1000);
+//! ```
+//!
+//! ### Time-Based Iteration
+//!
+//! Use `duration_ms` to run for a fixed duration (auto-enables wrap-around):
+//!
+//! ```rust,no_run
+//! use keyspace_tracker::{PrefixTracker, SamplingConfig};
+//!
+//! let tracker = PrefixTracker::simple("vec:");
+//! for i in 0..100 { tracker.add(i); }
+//!
+//! // Run for 60 seconds, cycling through keyspace
+//! let items: Vec<_> = tracker.iter()
+//!     .set_only()
+//!     .with_sampling(SamplingConfig::default().with_duration_ms(60_000))
+//!     .random()
+//!     .collect();
+//! ```
 
 use std::sync::atomic::Ordering;
 
@@ -163,6 +221,8 @@ impl<'a> TrackerIterBuilder<'a> {
     /// Build a sequential (ascending order) iterator.
     pub fn sequential(self) -> SequentialIter<'a> {
         let max_id = self.range.id_max.min(self.tracker.effective_max_id());
+        // Auto-enable wrap_around when duration is set (time-based iteration)
+        let wrap_around = self.sampling.duration_ms.is_some();
 
         SequentialIter {
             tracker: self.tracker,
@@ -171,7 +231,7 @@ impl<'a> TrackerIterBuilder<'a> {
             current_id: self.range.id_min,
             current_sub_id: self.range.sub_id_min,
             max_id,
-            wrap_around: false,
+            wrap_around,
         }
     }
 
@@ -190,6 +250,13 @@ impl<'a> TrackerIterBuilder<'a> {
         let mut rng = self.sampling.make_rng();
         let offset = rng.u64(..) % range_size.max(1);
 
+        // If limit is set and exceeds range_size, allow revisits (cycling)
+        // This enables "1M requests on 100K keyspace" scenarios
+        let max_steps = match self.sampling.limit {
+            Some(limit) if limit > range_size => limit,
+            _ => range_size,
+        };
+
         RandomIter {
             tracker: self.tracker,
             range: self.range,
@@ -198,7 +265,7 @@ impl<'a> TrackerIterBuilder<'a> {
             multiplier,
             offset,
             current_step: 0,
-            max_steps: range_size,
+            max_steps,
         }
     }
 
@@ -724,7 +791,17 @@ impl<'a> RandomIter<'a> {
             return None;
         }
 
-        while self.current_step < self.max_steps {
+        loop {
+            // Check if we need to cycle
+            if self.current_step >= self.max_steps {
+                // Duration-based iteration cycles indefinitely
+                if self.ctx.sampling.duration_ms.is_some() {
+                    self.current_step = 0;
+                } else {
+                    return None;
+                }
+            }
+            
             self.current_step += 1;
 
             // Select index based on distribution
@@ -762,8 +839,6 @@ impl<'a> RandomIter<'a> {
             self.ctx.record_yield();
             return Some(id);
         }
-
-        None
     }
 }
 
@@ -2049,5 +2124,442 @@ mod tests {
             total_read.load(Ordering::SeqCst),
             (num_workers * reads_per_worker) as u64
         );
+    }
+
+    #[test]
+    fn test_random_cycling_limit_exceeds_keyspace() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(10));
+
+        // Add all IDs
+        for i in 0..10 {
+            tracker.add(i);
+        }
+
+        // Request 50 items from a 10-item keyspace - should cycle
+        let items: Vec<_> = tracker
+            .iter()
+            .set_only()
+            .with_sampling(SamplingConfig::default().with_limit(50))
+            .random()
+            .collect();
+
+        assert_eq!(items.len(), 50, "Should return exactly 50 items");
+
+        // All IDs should be in valid range
+        for (id, _) in &items {
+            assert!(*id < 10, "ID {} should be within range 0-9", id);
+        }
+    }
+
+    #[test]
+    fn test_random_cycling_multithreaded() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let tracker = Arc::new(PrefixTracker::new(
+            TrackerConfig::simple("vec:").with_max_id(100),
+        ));
+
+        // Add all IDs
+        for i in 0..100 {
+            tracker.add(i);
+        }
+
+        let total_read = Arc::new(AtomicU64::new(0));
+        let num_workers = 4;
+        let reads_per_worker = 500; // 2000 total from 100 IDs = 20 cycles each
+
+        let handles: Vec<_> = (0..num_workers)
+            .map(|worker_id| {
+                let t = tracker.clone();
+                let counter = total_read.clone();
+                thread::spawn(move || {
+                    // Each worker uses a different seed for variety
+                    let items: Vec<_> = t
+                        .iter()
+                        .set_only()
+                        .with_sampling(
+                            SamplingConfig::default()
+                                .with_limit(reads_per_worker as u64)
+                                .with_seed(worker_id as u64),
+                        )
+                        .random()
+                        .collect();
+
+                    assert_eq!(items.len(), reads_per_worker);
+                    for (id, _) in &items {
+                        assert!(*id < 100, "ID should be within range");
+                    }
+                    counter.fetch_add(items.len() as u64, Ordering::Relaxed);
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        assert_eq!(
+            total_read.load(Ordering::SeqCst),
+            (num_workers * reads_per_worker) as u64
+        );
+    }
+
+    #[test]
+    fn test_random_duration_based_cycling() {
+        use std::time::Instant;
+
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(10));
+
+        // Add all IDs
+        for i in 0..10 {
+            tracker.add(i);
+        }
+
+        // Run for 100ms - should cycle many times through 10 items
+        let start = Instant::now();
+        let items: Vec<_> = tracker
+            .iter()
+            .set_only()
+            .with_sampling(SamplingConfig::default().with_duration_ms(100))
+            .random()
+            .collect();
+
+        let elapsed = start.elapsed().as_millis();
+
+        // Should have run for approximately 100ms
+        assert!(elapsed >= 90, "Should run for at least 90ms, got {}ms", elapsed);
+        assert!(elapsed < 200, "Should not run much longer than 100ms, got {}ms", elapsed);
+
+        // Should have collected many items (cycling through keyspace)
+        assert!(items.len() > 10, "Should have cycled through keyspace at least once");
+
+        // All IDs should be in valid range
+        for (id, _) in &items {
+            assert!(*id < 10, "ID should be within range");
+        }
+    }
+
+    #[test]
+    fn test_random_duration_multithreaded() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::Instant;
+
+        let tracker = Arc::new(PrefixTracker::new(
+            TrackerConfig::simple("vec:").with_max_id(100),
+        ));
+
+        // Add all IDs
+        for i in 0..100 {
+            tracker.add(i);
+        }
+
+        let total_read = Arc::new(AtomicU64::new(0));
+        let num_workers = 4;
+        let duration_ms = 50;
+
+        let start = Instant::now();
+
+        let handles: Vec<_> = (0..num_workers)
+            .map(|worker_id| {
+                let t = tracker.clone();
+                let counter = total_read.clone();
+                thread::spawn(move || {
+                    let items: Vec<_> = t
+                        .iter()
+                        .set_only()
+                        .with_sampling(
+                            SamplingConfig::default()
+                                .with_duration_ms(duration_ms)
+                                .with_seed(worker_id as u64),
+                        )
+                        .random()
+                        .collect();
+
+                    for (id, _) in &items {
+                        assert!(*id < 100, "ID should be within range");
+                    }
+                    counter.fetch_add(items.len() as u64, Ordering::Relaxed);
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let elapsed = start.elapsed().as_millis();
+
+        // All workers should complete around the same time
+        assert!(elapsed >= 40, "Should run for at least 40ms");
+        assert!(elapsed < 150, "Should not run much longer than duration");
+
+        // Should have read many items across all workers
+        let total = total_read.load(Ordering::SeqCst);
+        assert!(total > 100, "Should have cycled through keyspace");
+    }
+
+    #[test]
+    fn test_sequential_duration_based() {
+        use std::time::Instant;
+
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(10));
+
+        // Add all IDs
+        for i in 0..10 {
+            tracker.add(i);
+        }
+
+        // Run for 100ms with duration - should auto-enable wrap_around
+        let start = Instant::now();
+        let items: Vec<_> = tracker
+            .iter()
+            .set_only()
+            .with_sampling(SamplingConfig::default().with_duration_ms(100))
+            .sequential()
+            .collect();
+
+        let elapsed = start.elapsed().as_millis();
+
+        // Should have run for approximately 100ms
+        assert!(elapsed >= 90, "Should run for at least 90ms");
+        assert!(elapsed < 200, "Should not run much longer than 100ms");
+
+        // Should have collected many items (cycling through keyspace)
+        assert!(items.len() > 10, "Should have cycled through keyspace");
+
+        // Items should be in sequential order with wraparound
+        // First 10 should be 0-9, next 10 should be 0-9 again, etc.
+        for (i, (id, _)) in items.iter().enumerate() {
+            assert_eq!(*id, (i % 10) as u64, "Sequential order with wraparound");
+        }
+    }
+
+    #[test]
+    fn test_sequential_duration_multithreaded() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let tracker = Arc::new(PrefixTracker::new(
+            TrackerConfig::simple("vec:").with_max_id(100),
+        ));
+
+        // Add all IDs
+        for i in 0..100 {
+            tracker.add(i);
+        }
+
+        let total_read = Arc::new(AtomicU64::new(0));
+        let num_workers = 4;
+        let duration_ms = 50;
+
+        let handles: Vec<_> = (0..num_workers)
+            .map(|_| {
+                let t = tracker.clone();
+                let counter = total_read.clone();
+                thread::spawn(move || {
+                    let items: Vec<_> = t
+                        .iter()
+                        .set_only()
+                        .with_sampling(SamplingConfig::default().with_duration_ms(duration_ms))
+                        .sequential()
+                        .collect();
+
+                    for (id, _) in &items {
+                        assert!(*id < 100, "ID should be within range");
+                    }
+                    counter.fetch_add(items.len() as u64, Ordering::Relaxed);
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let total = total_read.load(Ordering::SeqCst);
+        assert!(total > 100, "Should have cycled through keyspace across all workers");
+    }
+
+    #[test]
+    fn test_partitioned_with_limit() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(100));
+
+        // Add all IDs
+        for i in 0..100 {
+            tracker.add(i);
+        }
+
+        // Partitioned iteration with limit that exceeds partition size
+        // partition(0, 4) covers IDs 0-24 (25 items)
+        // limit of 50 should cycle through the partition twice
+        let items: Vec<_> = tracker
+            .iter()
+            .set_only()
+            .with_sampling(SamplingConfig::default().with_limit(50))
+            .partition(0, 4)
+            .take(50)
+            .collect();
+
+        // Partitioned iterator doesn't have wrap_around, so it will stop at partition end
+        // It should collect at most 25 items (the partition size)
+        assert!(items.len() <= 25, "Partitioned iter stops at partition boundary");
+
+        // All IDs should be in first partition (0-24)
+        for (id, _) in &items {
+            assert!(*id < 25, "ID {} should be in partition 0-24", id);
+        }
+    }
+
+    #[test]
+    fn test_partitioned_multithreaded_disjoint() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::Arc;
+        use std::thread;
+
+        let tracker = Arc::new(PrefixTracker::new(
+            TrackerConfig::simple("vec:").with_max_id(100),
+        ));
+
+        // Add all IDs
+        for i in 0..100 {
+            tracker.add(i);
+        }
+
+        let total_read = Arc::new(AtomicU64::new(0));
+        let num_workers = 4;
+
+        let handles: Vec<_> = (0..num_workers)
+            .map(|worker_id| {
+                let t = tracker.clone();
+                let counter = total_read.clone();
+                thread::spawn(move || {
+                    let items: Vec<_> = t
+                        .iter()
+                        .set_only()
+                        .partition(worker_id, num_workers)
+                        .collect();
+
+                    // Verify IDs are in correct partition
+                    let partition_start = (worker_id * 100) / num_workers;
+                    let partition_end = ((worker_id + 1) * 100) / num_workers;
+                    for (id, _) in &items {
+                        assert!(
+                            *id >= partition_start as u64 && *id < partition_end as u64,
+                            "ID {} should be in partition {}-{}",
+                            id,
+                            partition_start,
+                            partition_end
+                        );
+                    }
+                    counter.fetch_add(items.len() as u64, Ordering::Relaxed);
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        // All 100 items should be read exactly once across all partitions
+        assert_eq!(total_read.load(Ordering::SeqCst), 100);
+    }
+
+    #[test]
+    fn test_delete_iter_single_pass() {
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(10));
+
+        // Add all IDs
+        for i in 0..10 {
+            tracker.add(i);
+        }
+
+        // Delete iterator - exclusive, no wrap_around available
+        let mut iter = tracker.iter().set_only().delete().unwrap();
+
+        // Delete all items
+        let mut deleted_ids = Vec::new();
+        while let Some((id, _)) = iter.next() {
+            deleted_ids.push(id);
+        }
+
+        assert_eq!(deleted_ids.len(), 10, "Should delete all 10 items");
+
+        // All IDs should be in valid range
+        for id in &deleted_ids {
+            assert!(*id < 10, "ID should be within range");
+        }
+
+        // Tracker should be empty
+        drop(iter);
+        assert_eq!(tracker.count(), 0, "Tracker should be empty after delete");
+    }
+
+    #[test]
+    fn test_limit_with_duration_limit_wins() {
+        use std::time::Instant;
+
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(100));
+
+        // Add all IDs
+        for i in 0..100 {
+            tracker.add(i);
+        }
+
+        // Set both limit (50) and duration (1000ms) - limit should win
+        let start = Instant::now();
+        let items: Vec<_> = tracker
+            .iter()
+            .set_only()
+            .with_sampling(
+                SamplingConfig::default()
+                    .with_limit(50)
+                    .with_duration_ms(1000),
+            )
+            .random()
+            .collect();
+
+        let elapsed = start.elapsed().as_millis();
+
+        // Should stop at limit, not duration
+        assert_eq!(items.len(), 50, "Should stop at limit of 50");
+        assert!(elapsed < 500, "Should finish quickly, not wait for duration");
+    }
+
+    #[test]
+    fn test_duration_with_limit_duration_wins() {
+        use std::time::Instant;
+
+        let tracker = PrefixTracker::new(TrackerConfig::simple("vec:").with_max_id(10));
+
+        // Add all IDs
+        for i in 0..10 {
+            tracker.add(i);
+        }
+
+        // Set both limit (very high) and duration (50ms) - duration should win
+        // Use u64::MAX as limit to ensure duration is always the limiting factor
+        let start = Instant::now();
+        let items: Vec<_> = tracker
+            .iter()
+            .set_only()
+            .with_sampling(
+                SamplingConfig::default()
+                    .with_limit(u64::MAX)
+                    .with_duration_ms(50),
+            )
+            .random()
+            .collect();
+
+        let elapsed = start.elapsed().as_millis();
+
+        // Should stop at duration, not limit
+        assert!(elapsed >= 40, "Should run for at least 40ms");
+        assert!(elapsed < 150, "Should stop around 50ms");
+        assert!(items.len() > 10, "Should have cycled through keyspace");
     }
 }

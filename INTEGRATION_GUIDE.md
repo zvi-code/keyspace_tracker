@@ -228,16 +228,18 @@ Statistical distributions for realistic workload simulation:
 | **Overlapping** | `.overlapping().random()` | Yes | Contention testing |
 | **Claim** | `.write()` / `.continue_write()` | Yes (atomic) | Exactly-once processing |
 
-### Wrap-Around for Indefinite Iteration
+### Wrap-Around and Time-Based Iteration
 
 By default, iterators stop when the keyspace is exhausted. For benchmarks requiring
-indefinite iteration, use `.wrap_around()`:
+indefinite iteration or fixed-duration runs, use wrap-around or time-based modes:
 
-| Iterator | Default | With `.wrap_around()` |
-|----------|---------|----------------------|
-| `sequential()` | Stops at end | Cycles back to start |
-| `write()` | Stops when full | Clears bitmap, restarts |
-| `random()` | Samples with replacement | Already cycles (no wrap needed) |
+| Iterator | Default | With `.wrap_around()` | With `duration_ms` |
+|----------|---------|----------------------|-------------------|
+| `sequential()` | Stops at end | Cycles back to start | Auto wrap-around |
+| `write()` | Stops when full | Clears bitmap, restarts | N/A |
+| `random()` | Stops at keyspace size | N/A (use limit) | Cycles indefinitely |
+
+#### Wrap-Around Mode
 
 ```rust
 // Sequential read - cycles through existing keys forever
@@ -258,6 +260,51 @@ let handles: Vec<_> = (0..num_workers).map(|_| {
     })
 }).collect();
 ```
+
+#### Random Cycling with Limit > Keyspace
+
+When `limit` exceeds keyspace size, `RandomIter` automatically cycles to fulfill
+the request. This enables "1M requests on 100K keys" scenarios:
+
+```rust
+use keyspace_tracker::SamplingConfig;
+
+// Request 1,000,000 random samples from 100,000-key space
+let items: Vec<_> = tracker.iter()
+    .set_only()
+    .with_sampling(SamplingConfig::default().with_limit(1_000_000))
+    .random()
+    .collect();
+assert_eq!(items.len(), 1_000_000);  // Cycles through keyspace ~10 times
+```
+
+#### Time-Based Iteration
+
+Use `duration_ms` to run for a fixed duration (auto-enables wrap-around):
+
+```rust
+use keyspace_tracker::SamplingConfig;
+
+// Run for 60 seconds, cycling through keyspace
+let items: Vec<_> = tracker.iter()
+    .set_only()
+    .with_sampling(SamplingConfig::default().with_duration_ms(60_000))
+    .random()
+    .collect();
+// Collects items until 60 seconds elapsed
+
+// Combine limit and duration - stops when either is reached first
+let items: Vec<_> = tracker.iter()
+    .set_only()
+    .with_sampling(
+        SamplingConfig::default()
+            .with_limit(1_000_000)
+            .with_duration_ms(30_000)  // 30 seconds max
+    )
+    .random()
+    .collect();
+```
+
 
 ### Partitioning Strategies
 
@@ -799,6 +846,7 @@ impl<'a> TrackerIterBuilder<'a> {
     pub fn sample(self, probability: f64) -> Self;
     pub fn limit(self, max_items: u64) -> Self;
     pub fn seed(self, seed: u64) -> Self;
+    pub fn with_sampling(self, config: SamplingConfig) -> Self;
     
     // === Distribution ===
     pub fn distribution(self, dist: AccessDistribution) -> Self;
@@ -830,6 +878,49 @@ impl WriteIter<'a> {
     /// Enable wrap-around: when keyspace exhausted, reset cursor and clear
     /// bitmap to allow re-claiming IDs indefinitely.
     pub fn wrap_around(self) -> Self;
+}
+```
+
+### SamplingConfig
+
+```rust
+/// Configuration for iteration sampling, limits, and duration.
+pub struct SamplingConfig {
+    pub set_ratio: Option<f64>,           // Ratio of set vs unset bits (0.0-1.0)
+    pub limit: Option<u64>,               // Maximum items to return
+    pub duration_ms: Option<u64>,         // Maximum duration in milliseconds
+    pub sample_probability: f64,          // Probabilistic sampling (0.0-1.0)
+    pub seed: Option<u64>,                // Random seed for reproducibility
+    pub distribution: AccessDistribution, // Key access distribution
+    pub overlapping: bool,                // Allow multiple threads to visit same keys
+}
+
+impl SamplingConfig {
+    pub const fn new() -> Self;
+    
+    /// Set mixed ratio: proportion of set (existing) vs unset (new) items.
+    pub const fn with_set_ratio(self, ratio: f64) -> Self;
+    
+    /// Limit number of items returned.
+    /// For RandomIter: if limit > keyspace size, iterator cycles automatically.
+    pub const fn with_limit(self, limit: u64) -> Self;
+    
+    /// Set duration limit in milliseconds.
+    /// Iteration continues (with wrap-around) until duration expires.
+    /// Useful for time-based workloads like "run for 60 seconds".
+    pub const fn with_duration_ms(self, duration_ms: u64) -> Self;
+    
+    /// Set probabilistic sampling (each item has `prob` chance of being returned).
+    pub const fn with_sample_probability(self, prob: f64) -> Self;
+    
+    /// Set seed for reproducible random iteration.
+    pub const fn with_seed(self, seed: u64) -> Self;
+    
+    /// Set access distribution (Uniform, Zipfian, Exponential, etc.).
+    pub const fn with_distribution(self, dist: AccessDistribution) -> Self;
+    
+    /// Enable overlapping mode for contention testing.
+    pub const fn with_overlapping(self, enabled: bool) -> Self;
 }
 ```
 

@@ -68,6 +68,11 @@ pub struct SamplingConfig {
     /// Maximum number of items to return. None = unlimited.
     pub limit: Option<u64>,
 
+    /// Duration limit for iteration (in milliseconds). None = unlimited.
+    /// When set, iteration continues until the duration expires.
+    /// Combines with `limit` - iteration stops when either is reached.
+    pub duration_ms: Option<u64>,
+
     /// Probabilistic sampling ratio (0.0-1.0).
     /// Each matching item has this probability of being returned.
     /// 1.0 = return all matching, 0.5 = return ~50% of matching.
@@ -92,6 +97,7 @@ impl SamplingConfig {
         Self {
             set_ratio: None,
             limit: None,
+            duration_ms: None,
             sample_probability: 1.0,
             seed: None,
             distribution: AccessDistribution::Uniform,
@@ -114,6 +120,16 @@ impl SamplingConfig {
     #[inline]
     pub const fn with_limit(mut self, limit: u64) -> Self {
         self.limit = Some(limit);
+        self
+    }
+
+    /// Set duration limit for iteration (in milliseconds).
+    ///
+    /// Iteration will continue (with wraparound) until the duration expires.
+    /// This enables time-based workloads like "run for 60 seconds".
+    #[inline]
+    pub const fn with_duration_ms(mut self, duration_ms: u64) -> Self {
+        self.duration_ms = Some(duration_ms);
         self
     }
 
@@ -164,6 +180,7 @@ impl SamplingConfig {
     #[inline]
     pub fn has_sampling(&self) -> bool {
         self.limit.is_some() 
+            || self.duration_ms.is_some()
             || self.sample_probability < 1.0 
             || self.set_ratio.is_some()
             || !matches!(self.distribution, AccessDistribution::Uniform)
@@ -224,6 +241,8 @@ pub struct FilterContext {
     pub(crate) sampling: SamplingConfig,
     rng: fastrand::Rng,
     yielded: u64,
+    /// Start time for duration-based iteration (milliseconds since UNIX epoch).
+    start_time_ms: Option<u64>,
 }
 
 impl FilterContext {
@@ -231,21 +250,43 @@ impl FilterContext {
     #[inline]
     pub fn new(filter: BitFilter, sampling: SamplingConfig) -> Self {
         let rng = sampling.make_rng();
+        let start_time_ms = sampling.duration_ms.map(|_| Self::current_time_ms());
         Self {
             filter,
             sampling,
             rng,
             yielded: 0,
+            start_time_ms,
         }
     }
 
-    /// Check if we should continue iterating (respects limit).
+    /// Get current time in milliseconds since UNIX epoch.
+    #[inline]
+    fn current_time_ms() -> u64 {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    /// Check if we should continue iterating (respects limit and duration).
     #[inline]
     pub fn check_limit(&self) -> bool {
-        match self.sampling.limit {
-            Some(limit) => self.yielded < limit,
-            None => true,
+        // Check count limit
+        if let Some(limit) = self.sampling.limit {
+            if self.yielded >= limit {
+                return false;
+            }
         }
+        // Check duration limit
+        if let (Some(duration_ms), Some(start_time_ms)) = (self.sampling.duration_ms, self.start_time_ms) {
+            let elapsed = Self::current_time_ms().saturating_sub(start_time_ms);
+            if elapsed >= duration_ms {
+                return false;
+            }
+        }
+        true
     }
 
     /// Check if item matches filter (with mixed-ratio support).

@@ -181,6 +181,56 @@
 //! assert_eq!(total, 10000);
 //! ```
 //!
+//! ### Wrap-Around Iteration
+//!
+//! ```rust
+//! use keyspace_tracker::PrefixTracker;
+//!
+//! let tracker = PrefixTracker::simple("vec:");
+//! for i in 0..100 { tracker.add(i); }
+//!
+//! // Sequential wrap-around: cycle through keys indefinitely
+//! let mut iter = tracker.iter().set_only().sequential().wrap_around();
+//! for _ in 0..500 {
+//!     let (id, _) = iter.next().unwrap();
+//!     // IDs cycle: 0,1,2,...,99,0,1,2,...
+//! }
+//! ```
+//!
+//! ### Cycling with Limit > Keyspace
+//!
+//! ```rust
+//! use keyspace_tracker::{PrefixTracker, SamplingConfig};
+//!
+//! let tracker = PrefixTracker::simple("vec:");
+//! for i in 0..100 { tracker.add(i); }
+//!
+//! // Request 1000 random samples from 100-key space
+//! let items: Vec<_> = tracker.iter()
+//!     .set_only()
+//!     .with_sampling(SamplingConfig::default().with_limit(1000))
+//!     .random()
+//!     .collect();
+//! assert_eq!(items.len(), 1000);
+//! ```
+//!
+//! ### Time-Based Iteration
+//!
+//! ```rust,no_run
+//! use keyspace_tracker::{PrefixTracker, SamplingConfig};
+//!
+//! let tracker = PrefixTracker::simple("vec:");
+//! for i in 0..100 { tracker.add(i); }
+//!
+//! // Run for 60 seconds, cycling through keyspace
+//! let items: Vec<_> = tracker.iter()
+//!     .set_only()
+//!     .with_sampling(SamplingConfig::default().with_duration_ms(60_000))
+//!     .random()
+//!     .collect();
+//! // Collects many items until 60s elapsed
+//! ```
+//!
 //! ### Group Iteration with Policies
 //!
 //! ```rust
